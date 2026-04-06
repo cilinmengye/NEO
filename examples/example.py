@@ -100,7 +100,7 @@ if __name__ == '__main__':
         profile_result_path=args.profile_result_path,
 
         extra_layer_for_cprf=True,
-        tensor_parallel_degree=1
+        tensor_parallel_degree=args.tp_degree
     )
 
     start_time = time.perf_counter()

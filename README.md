@@ -1,3 +1,15 @@
+# 复现总结
+
+* 基于Docker成功构建其和NEO论文同**软件实验环境**, 硬件环境主要区别在于GPU(I am 4090), CPU(I am v80)
+
+* 复现fig6c. 基于4090成功复现出在特定参数配置下，不同请求速率下ouput token latency显示 vllm > neo. 具体看`NEO/evaluation/pics/highgpumempress_conf`。复现的秘诀是尽量让GPU KV Cache block非常紧张，因为vllm开启的参数是`--preemption-mode recompute`, 那么在KV Cache block 紧张的情况下会引发强制，导致重算，让vllm延迟变高。因为NEO实现了offload CPU to compute, 所以对于NEO是存在在相同请求速率下ouput token latency显示 vllm > neo情况的。
+
+   * 论文仓库配置`config-t4-7b.json` 令 `num_gpu_blocks_override * block_size == max_num_batched_tokens == max_model_len`, 而且其把`num_gpu_blocks_override`设置的很低，即尽量让GPU KV Cache block非常紧张。原理就是**人为把 GPU KV/block 容量压到较紧，用较小的 iteration token budget 运行，使系统更容易进入 KV 紧张和 preemption 区；由于vllm设置选的是 recompute，紧张时更可能发生的是丢弃 KV 后重算，而不是换到 CPU。**
+
+* NEO 理论上真正强大之处在于 **吞吐量**，因为其摘要就写着 `However, the limited GPU memory has largely limited the batch size achieved in practice, leaving significant GPU compute resources wasted.We present NEO, an online LLM inference system that offloads part of attention compute and KV cache states from the GPU to the local host CPU, effectively increasing the GPU batch size and thus inference throughput.`
+
+   * 虽然其最后展示的吞吐量依旧是比vllm低，理由是代码实现的不高效；但是其确实比同类(swiftllm)吞吐量更高。
+
 # NEO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
 
 Online LLM inference powers many exciting applications such as intelligent chatbots and autonomous agents. Modern LLM inference engines widely rely on request batching to improve inference throughput, aiming to make it cost-efficient when running on expensive GPU accelerators. However, the limited GPU memory has largely limited the batch size achieved in practice, leaving significant GPU compute resources wasted. 
@@ -114,3 +126,61 @@ Below are instructions for reproducing Figure 6c in the paper. Instructions for 
 - For Figure 10a, only 2 lines (x16large and baseline) in the original figure will be drawn.
 
 > NOTE: You can change the hyperparameters of the experiments by modifying the corresponding scripts. Please refer to comments in the code for detailed instructions.
+
+# Environment Build
+
+1. docker file: `NEO/docker/Dockerfile.cu124`
+
+
+2. docker build image
+
+```
+docker build -f docker/Dockerfile.cu124 -t neo-cu124-ispc123:dev .
+```
+
+3. run docker container
+
+```
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  --ulimit nofile=524288:524288 \
+  --cap-add SYS_NICE \
+  -v /home/yxlin/github/swift/NEO:/workspace/NEO \
+  -v /mnt/hdd/data/yxlin/huggingface/:/workspace/huggingface \
+  -v /tmp:/tmp \
+  -w /workspace/NEO \
+  --name neo-cu124-ispc123 \
+  neo-cu124-ispc123:dev
+```
+
+4. In container, build uv venv
+
+```
+cd /workspace/NEO
+uv venv .venv --python 3.12.12 --seed
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+pip install -e csrc --no-build-isolation
+```
+
+5. In container, build vllm uv venv
+
+```
+uv venv .venv_vllm --python 3.12.12 --seed
+source .venv_vllm/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install vllm==0.7.3
+```
+
+> 如果遇到类似 `TypeError: non-default argument 'vision_config' follows default argument` 的错误
+> 可以尝试减低 transformers 版本: `/workspace/NEO/.venv_vllm/bin/pip install "transformers<5"`
+
+<hr>
+
+> ps: 
+> * 强制删除容器: `docker rmi neo-cu124-ispc123:dev`
+> * 

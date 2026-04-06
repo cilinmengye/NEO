@@ -9,6 +9,9 @@ neo_dir = os.path.dirname(cur_dir)
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=f"{cur_dir}/evaluation.log", level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
 
+# change base on my environment
+VLLM_BIN = os.path.join(neo_dir, ".venv_vllm", "bin", "vllm")
+
 server_proc = None
 
 def start_server(name: str, config: dict):
@@ -25,13 +28,13 @@ def start_server(name: str, config: dict):
             max_num_seqs = min(int(chunk_size_str), config["max_num_seqs"])
             server_proc = subprocess.Popen(
                 numacmd + [
-                    "vllm", "serve", config["model_path"], "--port", "8000",
+                    VLLM_BIN, "serve", config["model_path"], "--port", "8000",
                     "--block-size", str(config["block_size"]),
                     "--max-model-len", str(config["max_model_len"]),
                     "--max-num-seqs", str(max_num_seqs),
                     "--max-num-batched-tokens", chunk_size_str,
                     "--tensor-parallel-size", str(config["tensor_parallel_size"]),
-                    # "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
+                    "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
                     "--num-gpu-blocks-override", str(config["num_gpu_blocks_override"]),
                     "--swap-space", str(config["swap_space"] / config["tensor_parallel_size"]),
                     "--enforce-eager",
@@ -57,11 +60,13 @@ def start_server(name: str, config: dict):
                 swap_space = config["swap_space"] // 8
             elif name == "ours":
                 cmd=["--extra-layer-for-cprf"]
-                num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                # num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                num_gpu_blocks_override = config["num_gpu_blocks_override"]
                 swap_space = config["swap_space"]
             else:
                 cmd=["--disable-partial-offl", "--extra-layer-for-cprf"]
-                num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                # num_gpu_blocks_override = config["num_gpu_blocks_override"] * nl // (nl + 1)
+                num_gpu_blocks_override = config["num_gpu_blocks_override"]
                 swap_space = config["swap_space"]
             
             cmd = numacmd + [
@@ -74,7 +79,7 @@ def start_server(name: str, config: dict):
                 "--max-batch-size", str(config["max_num_seqs"]),
                 "--max-tokens-in-batch", str(config["max_num_batched_tokens"]),
                 "--tensor-parallel-degree", str(config["tensor_parallel_size"]),
-                # "--gpu-mem-utilization", str(config["gpu_memory_utilization"]),
+                "--gpu-mem-utilization", str(config["gpu_memory_utilization"]),
                 "--num-gpu-blocks-override", str(num_gpu_blocks_override),
                 "--swap-space", str(swap_space),
                 "--library-path", f"{neo_dir}/pacpu/build/{config['library']}",
@@ -95,6 +100,16 @@ def start_server(name: str, config: dict):
         while True:
             time.sleep(5)
             time_counter += 5
+
+            # 防止启动失败导致无限循环
+            ret = server_proc.poll()
+            if ret is not None:
+                with open(f"{cur_dir}/{name}-server.log", "r") as f:
+                    log_text = f.read()
+                raise RuntimeError(
+                    f"{name} failed to start, exit code={ret}\n{log_text}"
+                )
+
             logger.info(f"{time_counter}s elapsed, checking server log ...")
             with open(f"{cur_dir}/{name}-server.log", "r") as f:
                 if "Started server process" in f.read():
