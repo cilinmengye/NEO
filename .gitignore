@@ -175,3 +175,4 @@ profile_results/
 # NEO evaluation results
 evaluation/results/
 evaluation/*.pdf
+evaluation/*.log
