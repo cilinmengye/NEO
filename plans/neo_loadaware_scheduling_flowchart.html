@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NEO Load-Aware Scheduling Flowchart</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: #121a31;
+      --panel-2: #18223f;
+      --text: #e8eefc;
+      --muted: #a9b5d1;
+      --paper: #1e3a8a;
+      --code: #0f766e;
+      --heur: #92400e;
+      --warn: #7f1d1d;
+      --line: #35508a;
+      --accent: #60a5fa;
+      --good: #34d399;
+      --bad: #f59e0b;
+      --chip: #243559;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #09101d 0%, #0b1020 100%);
+      color: var(--text);
+      font-family: Inter, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.5;
+    }
+    .container {
+      width: min(1500px, calc(100vw - 32px));
+      margin: 24px auto 48px;
+    }
+    h1, h2, h3, p { margin: 0; }
+    .hero, .panel {
+      background: rgba(18, 26, 49, 0.96);
+      border: 1px solid #223153;
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 18px 40px rgba(0,0,0,0.25);
+    }
+    .hero {
+      margin-bottom: 18px;
+    }
+    .hero h1 {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+    .hero p {
+      color: var(--muted);
+      max-width: 1100px;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--chip);
+      color: var(--text);
+      font-size: 13px;
+      border: 1px solid #31456f;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .paper { background: var(--paper); }
+    .code { background: var(--code); }
+    .heur { background: var(--heur); }
+    .warn { background: var(--warn); }
+
+    .section-title {
+      font-size: 20px;
+      margin-bottom: 14px;
+    }
+    .section-subtitle {
+      color: var(--muted);
+      font-size: 14px;
+      margin-bottom: 14px;
+    }
+    .stack {
+      display: grid;
+      gap: 18px;
+    }
+    .row {
+      display: grid;
+      gap: 16px;
+    }
+    .row.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .row.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .row.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .flow {
+      display: grid;
+      gap: 12px;
+    }
+    .node {
+      background: var(--panel-2);
+      border: 1px solid #29406d;
+      border-radius: 14px;
+      padding: 14px 16px;
+      position: relative;
+    }
+    .node.paper-node { border-left: 5px solid var(--paper); }
+    .node.code-node { border-left: 5px solid var(--code); }
+    .node.heur-node { border-left: 5px solid var(--heur); }
+    .node.warn-node { border-left: 5px solid var(--warn); }
+    .node h3 {
+      font-size: 15px;
+      margin-bottom: 6px;
+    }
+    .node p, .node li {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .node ul {
+      margin: 8px 0 0 18px;
+      padding: 0;
+    }
+    .arrow {
+      text-align: center;
+      color: var(--accent);
+      font-size: 24px;
+      line-height: 1;
+      margin: -2px 0;
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+    .divider {
+      align-self: stretch;
+      width: 2px;
+      background: linear-gradient(180deg, transparent, #3a578f, transparent);
+      border-radius: 999px;
+    }
+    .decision {
+      background: #1d2746;
+      border: 1px dashed #5d7abc;
+      border-radius: 18px;
+      padding: 14px 16px;
+    }
+    .decision strong { color: #dbeafe; }
+    .mini {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+    .equation {
+      display: block;
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: #0e162c;
+      border: 1px solid #22365f;
+      color: #c7dcff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .lane-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #dbeafe;
+      margin-bottom: 8px;
+    }
+    .footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 1100px) {
+      .row.cols-2, .row.cols-3, .row.cols-4, .split {
+        grid-template-columns: 1fr;
+      }
+      .divider { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="hero">
+      <h1>NEO Load-Aware Scheduling 详细流程图</h1>
+      <p>
+        这张图把论文 §3.2 与附录伪代码，映射到真实代码执行路径：
+        <code>engine.py → scheduler.py → block_manager.py → worker/model.py</code>。
+        阅读顺序建议从上到下：先看主循环，再看 scheduler 的每轮决策，再看 sequential / pipelined 模式选择，最后看 worker 如何执行。
+      </p>
+      <div class="legend">
+        <span class="chip"><span class="dot paper"></span>论文抽象步骤</span>
+        <span class="chip"><span class="dot code"></span>真实代码逻辑</span>
+        <span class="chip"><span class="dot heur"></span>代码特有 heuristic</span>
+        <span class="chip"><span class="dot warn"></span>局限 / 风险点</span>
+      </div>
+    </section>
+
+    <div class="stack">
+      <section class="panel">
+        <div class="section-title">A. 主循环总览：调度不是孤立算法，而是一次 iteration 的起点</div>
+        <div class="section-subtitle">对应 <code>swiftllm/server/engine.py</code> 的 <code>AsyncEngine._main_event_loop(...)</code></div>
+        <div class="flow">
+          <div class="node paper-node">
+            <h3>输入状态</h3>
+            <p>系统持续维护 waiting / GPU decode / CPU decode 三类请求状态，并在每轮 iteration 依据当前负载做局部决策。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>1) scheduler.get_next_batch()</h3>
+            <p>返回三个结果：</p>
+            <ul>
+              <li><code>batches</code>：本轮要 forward 的 1 个或 2 个 sub-batch</li>
+              <li><code>cur_swap_out</code>：本轮需要从 GPU → CPU 的请求</li>
+              <li><code>cur_swap_in</code>：本轮需要从 CPU → GPU 的请求</li>
+            </ul>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>2) block_manager.prepare(...)</h3>
+            <p>把高层调度决策翻译成 block table mapping、swap 参数、batch block 分配和 cprf 特殊 swap。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>3) executor.do_one_iteration(...)</h3>
+            <p>worker 侧根据 <code>len(batches)</code> 选择：</p>
+            <ul>
+              <li>1 batch → sequential mode</li>
+              <li>2 batches → pipelined mode</li>
+            </ul>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>4) update_and_free + remove_finished_requests</h3>
+            <p>写回 output token、释放已完成请求的 block、回收 request id，并更新调度器内部队列。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">B. Scheduler 状态机：三队列 + 预算 + block 约束</div>
+        <div class="section-subtitle">对应 <code>swiftllm/server/scheduler.py</code></div>
+        <div class="row cols-3">
+          <div class="node paper-node">
+            <h3>waiting_q</h3>
+            <p>尚未真正进入执行系统的新请求，等待被 admission。</p>
+          </div>
+          <div class="node paper-node">
+            <h3>gpu_decoding_q</h3>
+            <p>当前留在 GPU decode 路径上的活跃请求，默认优先继续服务。</p>
+          </div>
+          <div class="node paper-node">
+            <h3>cpu_decoding_q</h3>
+            <p>已经被换出或导向 CPU 路径的请求，后续可能 swap back。</p>
+          </div>
+        </div>
+        <div class="arrow">↓</div>
+        <div class="row cols-4">
+          <div class="node code-node">
+            <h3>ScheduleBudget</h3>
+            <p>同时限制 <code>max_batch_size</code> 与 <code>max_tokens_in_batch</code>。</p>
+          </div>
+          <div class="node code-node">
+            <h3>GPU blocks</h3>
+            <p>限制 GPU 上 decode / prefill 能否继续留驻。</p>
+          </div>
+          <div class="node code-node">
+            <h3>CPU blocks</h3>
+            <p>限制 CPU swap 空间是否足够接收新 offload 请求。</p>
+          </div>
+          <div class="node code-node">
+            <h3>Request IDs</h3>
+            <p>限制 block table 命名空间，避免新请求没有 <code>request_id</code> 可分配。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">C. `_get_next_batch_new(...)`：每轮调度主流程</div>
+        <div class="section-subtitle">这是论文附录伪代码在真实仓库中的核心落点</div>
+        <div class="flow">
+          <div class="node code-node">
+            <h3>Step 1. 先计算当前 GPU decode 集合的资源占用</h3>
+            <p>把 <code>gpu_decoding_q</code> 视为默认保留集合，统计其 GPU block 需求，并从 budget 中先扣掉这些请求占用的 batch/token。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 2. 若 budget overspent 或 GPU block 超阈值，则 swap out</h3>
+            <p>从 <code>gpu_decoding_q</code> 尾部弹出 victim，放到 <code>cpu_decoding_q</code> 头部，并记录到 <code>swpout_reqs</code>。</p>
+            <div class="mini">这是一种近似 FCFS：后到请求更容易被抢占，先到请求更稳定。</div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node heur-node">
+            <h3>Heuristic 1. swap-out / swap-in hysteresis</h3>
+            <p>真实代码采用：</p>
+            <span class="equation">swap_out_threshold = num_gpu_blocks
+swap_in_threshold  = round(swap_out_threshold * 0.95)</span>
+            <p>目的：避免在边界附近频繁来回 swap。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 3. 若 GPU 仍有余量，则尝试 swap in</h3>
+            <p>只看 <code>cpu_decoding_q</code> 队首。若 GPU block 和 budget 允许，则把它搬回 <code>gpu_decoding_q</code>。</p>
+            <div class="mini">按队首做 swap-in，继续体现 arrival-order fairness。</div>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 4. 试探性接纳 waiting_q 中的新 prefill 请求</h3>
+            <ul>
+              <li>检查 intermediate blocks 是否够</li>
+              <li>检查 CPU blocks 是否够</li>
+              <li>检查 request IDs 是否够</li>
+              <li>检查 batch/token budget 是否够</li>
+            </ul>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node heur-node">
+            <h3>Heuristic 2. prefill admission 的公平性规则</h3>
+            <p>优先把新 prefill 放入 GPU；但一旦更早的请求已被导向 CPU，后面更晚的请求也倾向继续进入 CPU，而不是重新插到 GPU 抢先。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 5. 调用 `_decide_mode_and_gen_batch(...)`</h3>
+            <p>把 <code>pref_to_gpu</code>、<code>pref_to_cpu</code> 和剩余 budget 交给模式决策器，决定本轮到底返回 1 个 batch 还是 2 个 sub-batches。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 6. 正式提交本轮 admission</h3>
+            <ul>
+              <li>从 <code>waiting_q</code> 真正弹出本轮要接纳的请求</li>
+              <li>为它们分配 <code>request_id</code></li>
+              <li>追加到 <code>gpu_decoding_q</code> 或 <code>cpu_decoding_q</code></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">D. `_decide_mode_and_gen_batch(...)`：模式选择与双 sub-batch 构造</div>
+        <div class="section-subtitle">这里决定 sequential mode 和 pipelined mode 谁更划算</div>
+        <div class="flow">
+          <div class="node code-node">
+            <h3>Step 1. 先形成两个候选世界</h3>
+            <ul>
+              <li><code>gpu_only_batch</code>：单 batch sequential 候选</li>
+              <li><code>batches[0], batches[1]</code>：双 sub-batch pipeline 候选</li>
+            </ul>
+            <p>一开始会把所有 prefill 与 GPU decode 先放入 batch 0。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node heur-node">
+            <h3>Heuristic 3. 先裁剪 sequential 候选中的 prefill</h3>
+            <p>如果 linear part 过大，就逐步减少 prefill，直到 batch 的 <code>s</code> 下降到 <code>linr_S_threshold</code> 附近。</p>
+            <span class="equation">linr_S_threshold = 128</span>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>Step 2. 把 CPU decode 请求拆入两个 sub-batches</h3>
+            <p>遍历 <code>cpu_decoding_q</code>，动态决定每个 cdec 请求加到 batch0 还是 batch1，而不是简单均分。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node paper-node">
+            <h3>核心思想：判断 CPU decode 是否能被 GPU 计算隐藏</h3>
+            <p>论文中的 load-aware，不只是“把 CPU 请求塞进第二个 batch”，而是估计重叠是否成立。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>`_get_remains(...)` 计算两个 batch 的 CPU capacity 余额</h3>
+            <span class="equation">remains[j] = batches[j^1].linr_T + batches[j].pref_T + batches[j].gdec_T - batches[j].cpu_time</span>
+            <p>直观含义：当 GPU 在推进这些工作时，CPU 是否还有机会把当前 batch 的 cdec 做完。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node heur-node">
+            <h3>Heuristic 4. `min_out_cpu_len` 剪枝</h3>
+            <p>如果某个 CPU decode 请求已经因为太重而导致 <code>min(remains) &lt; 0</code>，后面更长的 CPU decode 请求就直接跳过，避免重复尝试无效候选。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node heur-node">
+            <h3>Heuristic 5. 若 CPU 太空闲，再裁剪 batch0 的 prefill</h3>
+            <p>继续减少 batch0 prefill，让 pipeline 的 CPU/GPU overlap 更合理，避免结构失衡。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="decision">
+            <strong>最终决策：</strong> 比较 sequential throughput 与 pipelined throughput。
+            <span class="equation">seqential_time = gpu_only_batch.gpu_time * num_layers
+pipelined_time = (batch0.gpu_time + batch1.gpu_time) * num_layers
+seqential_rate = |gpu_only_batch| / seqential_time
+pipelined_rate = (|batch0| + |batch1|) / pipelined_time</span>
+            <div class="mini">若 <code>pipelined_rate</code> 更高，则返回 2 个 sub-batches；否则返回单个 <code>gpu_only_batch</code>。</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">E. 为什么叫 Load-Aware：性能预测来源</div>
+        <div class="section-subtitle">调度器不是拍脑袋，它依赖 profile tables 与插值</div>
+        <div class="row cols-2">
+          <div class="flow">
+            <div class="node code-node">
+              <h3>`BatchPerfData` 维护本轮 sub-batch 的局部负载</h3>
+              <ul>
+                <li><code>x</code>：请求数</li>
+                <li><code>s</code>：iteration width</li>
+                <li><code>n_g</code>：GPU decode token 总量</li>
+                <li><code>x_c</code>：CPU decode 请求数</li>
+                <li><code>n_c</code>：CPU decode token 总量</li>
+              </ul>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node code-node">
+              <h3>由 predictor 估计时间项</h3>
+              <ul>
+                <li><code>linr_T</code></li>
+                <li><code>pref_T</code></li>
+                <li><code>gdec_T</code></li>
+                <li><code>cdec_T</code></li>
+                <li><code>lnch_T</code></li>
+              </ul>
+            </div>
+          </div>
+          <div class="flow">
+            <div class="node code-node">
+              <h3>`TablePerfPredictor`</h3>
+              <p>保存四类 profile tables，并使用一维 / 二维插值估计未测点。</p>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node code-node">
+              <h3>`ModelProfiler.init_profile_tables(...)`</h3>
+              <p>真实构造 test cases，实际跑模型，收集 linear / prefill / GPU decode / CPU decode 的平均时间。</p>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node paper-node">
+              <h3>对应论文中的 profile-guided scheduling</h3>
+              <p>不是静态规则，而是“离线 profile + 在线插值 + 每轮 greedy 决策”。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">F. BlockManager：把调度决策落成 block 操作</div>
+        <div class="section-subtitle">对应 <code>swiftllm/server/block_manager.py</code></div>
+        <div class="flow">
+          <div class="node code-node">
+            <h3>1) conventional swap</h3>
+            <p>若本轮有 <code>cur_swap_out</code> 或 <code>cur_swap_in</code>，则调用 <code>_initiate_swap(...)</code>，获得 source/destination block 映射。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>2) 对每个 batch 调用 `set_model_forward_args(...)`</h3>
+            <p>把调度阶段的请求分类，转换成 worker 真正需要的 forward 参数：<code>num_cprfs / num_gprfs / num_gdecs / num_cdecs / sum_pref_toks / seq_block_size</code> 等。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>3) 给 GPU / CPU 两侧分配新 blocks</h3>
+            <p>这一步是真正把逻辑 batch 变成底层 block table state。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>4) 对 cprf 再做额外 swap</h3>
+            <p>CPU-prefill 请求并不是纯 CPU 路径，还要处理 intermediate cache → CPU 的特殊 swap。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">G. Worker 执行分支：1 个 batch 和 2 个 batch 的语义完全不同</div>
+        <div class="section-subtitle">对应 <code>swiftllm/worker/model.py</code> 与 <code>swiftllm/worker/layers/transformer_layer.py</code></div>
+        <div class="split">
+          <div class="flow">
+            <div class="lane-title">Sequential mode（返回 1 个 batch）</div>
+            <div class="node code-node">
+              <h3>`_forward_batches(...)` → `_forward_sequential(...)`</h3>
+              <p>所有 transformer layers 逐层顺序推进，一个 batch 走完整条路径。</p>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node paper-node">
+              <h3>适用场景</h3>
+              <p>pipeline 无法带来足够收益，或者当前负载结构下双 batch 会让吞吐下降。</p>
+            </div>
+          </div>
+          <div class="divider"></div>
+          <div class="flow">
+            <div class="lane-title">Pipelined mode（返回 2 个 sub-batches）</div>
+            <div class="node code-node">
+              <h3>`_forward_batches(...)` → `_forward_pipeline(...)`</h3>
+              <p>通过 <code>forward_first_stage</code>、<code>forward_double</code>、<code>forward_last_stage</code> 进行 layer-wise 流水。</p>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node code-node">
+              <h3>layer 内部的真实交错</h3>
+              <p>一批做 <code>postproj[i] → preproj[i+1]</code>，另一批做 <code>attention[i]</code>，两批在层之间交替推进。</p>
+            </div>
+            <div class="arrow">↓</div>
+            <div class="node paper-node">
+              <h3>适用场景</h3>
+              <p>CPU decode 能被 GPU 的 linear/prefill/gdec 工作有效隐藏，且总体吞吐预测更高。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">H. Paper vs Code：一致处与偏离处</div>
+        <div class="row cols-2">
+          <div class="flow">
+            <div class="node paper-node">
+              <h3>与论文一致的地方</h3>
+              <ul>
+                <li>每轮做 profile-guided greedy scheduling</li>
+                <li>同时考虑 prefill / GPU decode / CPU decode</li>
+                <li>显式比较 sequential 与 pipelined 两种候选</li>
+                <li>重视 CPU/GPU overlap，而不是只看单设备负载</li>
+              </ul>
+            </div>
+          </div>
+          <div class="flow">
+            <div class="node heur-node">
+              <h3>代码额外加入的工程化 heuristic</h3>
+              <ul>
+                <li><code>swap_in_threshold = round(swap_out_threshold * 0.95)</code> 防抖</li>
+                <li><code>linr_S_threshold = 128</code> 限制 linear 过载</li>
+                <li><code>min_out_cpu_len</code> 剪枝长 CPU decode 候选</li>
+                <li><code>pref_to_cpu</code> 的 fairness 规则</li>
+                <li>显式考虑 request-id 和 intermediate blocks</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">I. 这种调度方式的局限</div>
+        <div class="row cols-3">
+          <div class="node warn-node">
+            <h3>Heuristic 依赖硬件</h3>
+            <p>阈值与 profile tables 都可能随着 GPU、CPU、模型大小、kernel 实现变化而失效。</p>
+          </div>
+          <div class="node warn-node">
+            <h3>局部最优，不是全局最优</h3>
+            <p>它是 per-iteration greedy scheduler，不会显式优化长期 tail latency 或未来 contention。</p>
+          </div>
+          <div class="node warn-node">
+            <h3>fairness 只是近似 FCFS</h3>
+            <p>arrival order 受到保护，但资源约束与异构路径会让真实完成顺序偏离严格 FCFS。</p>
+          </div>
+          <div class="node warn-node">
+            <h3>overlap 判断是近似模型</h3>
+            <p><code>_get_remains()</code> 很聪明，但仍无法完全捕捉 stream 同步、PCIe、缓存、launch jitter 等细节。</p>
+          </div>
+          <div class="node warn-node">
+            <h3>边界附近可能 oscillation</h3>
+            <p>即便有 hysteresis，某些负载边界仍可能在 sequential 与 pipeline 之间反复切换。</p>
+          </div>
+          <div class="node warn-node">
+            <h3>最终 rate 公式偏向 GPU 侧</h3>
+            <p>CPU 影响更多通过 admission heuristic 间接体现，不是严格的联合优化目标。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="section-title">J. 复现时最该抓住的主线</div>
+        <div class="flow">
+          <div class="node paper-node">
+            <h3>核心原则</h3>
+            <p>不要把 NEO 理解成“固定地把一部分请求放 CPU”。真正的关键是：每轮都根据当前负载和 profile 结果，动态决定谁留 GPU、谁去 CPU、谁能进入系统、这一轮值不值得 pipeline。</p>
+          </div>
+          <div class="arrow">↓</div>
+          <div class="node code-node">
+            <h3>最值得反复读的 4 个函数</h3>
+            <ul>
+              <li><code>Scheduler._get_next_batch_new(...)</code></li>
+              <li><code>Scheduler._decide_mode_and_gen_batch(...)</code></li>
+              <li><code>BlockManager.prepare(...)</code></li>
+              <li><code>LlamaModel._forward_batches(...)</code></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <div class="footer">
+        本 HTML 流程图为本地静态文件，不依赖外部 JS。建议与配套报告 <code>neo_loadaware_shceduling_plan.md</code> 一起阅读。
+      </div>
+    </div>
+  </div>
+</body>
+</html>

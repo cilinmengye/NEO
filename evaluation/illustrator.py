@@ -5,9 +5,24 @@ import numpy as np
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 
-def get_lat_avg(file):
+
+def _get_successful_records(file):
     with open(file) as f:
         data = json.load(f)
+
+    # 新结果文件会额外写入 ok/error 字段；这里统一只消费成功请求。
+    # 旧结果文件没有 ok 字段时，get(..., True) 会保持原有兼容行为。
+    return [item for item in data if item.get('ok', True)]
+
+
+def get_lat_avg(file):
+    """
+    end - start 是单个请求的 completion time / latency:
+    此指标能回答:
+        单请求慢不慢
+        平均请求时延是多少
+    """
+    data = _get_successful_records(file)
     # only take latter half
     data = data[len(data) // 4:]
     return sum([(x['end'] - x['start']) / (x['output_len']) for x in data]) / len(data)
@@ -56,8 +71,7 @@ def draw_one_rl_diagram(
 def get_tp(filenames: list[str], interv: tuple[float, float]):
     tps = []
     for i, filename in enumerate(filenames):
-        with open(filename) as f:
-            data = json.load(f)
+        data = _get_successful_records(filename)
 
         times = sorted([d['end'] for d in data])
         data = [times[j] - times[j-1] for j in range(1, len(times))]
@@ -68,11 +82,11 @@ def get_tp(filenames: list[str], interv: tuple[float, float]):
         tps.append(1 / np.mean(data[nwarmup: ncooldown]))
     return tps
 
+
 def get_tp_token(filenames: list[str]):
     tps = []
     for i, filename in enumerate(filenames):
-        with open(filename) as f:
-            data = json.load(f)
+        data = _get_successful_records(filename)
 
         first_start = min([d['start'] for d in data])
         last_end = max([d['end'] for d in data])
@@ -103,7 +117,7 @@ def draw_one_ps_diagram(
             file_names = [f'{cur_dir}/results/{sys_name}-{num_datas[i]}-{input_lens[i]}-{out_len}-tp.json' for sys_name in [base_sys_name, sys_file_names[i]]]
             tp_pair = get_tp(file_names, interv)
             tps.append(tp_pair)
-               
+
         ratios = [tp1 / tp0 for tp0, tp1 in tps]
         ax.plot(output_lens, ratios, label=f'{legend_names[i]}', marker=markers[i])
 

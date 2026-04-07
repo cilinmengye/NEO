@@ -1,6 +1,6 @@
 # 复现总结
 
-* 基于Docker成功构建其和NEO论文同**软件实验环境**, 硬件环境主要区别在于GPU(I am 4090), CPU(I am v80)
+* 基于Docker成功构建其和NEO论文同**软件实验环境**, 硬件环境主要区别在于GPU(I am 4090), CPU(I am v80)。具体看`NEO/docker` 和 本 README.md `Environment Build`.
 
 * 复现fig6c. 基于4090成功复现出在特定参数配置下，不同请求速率下ouput token latency显示 vllm > neo. 具体看`NEO/evaluation/pics/highgpumempress_conf`。复现的秘诀是尽量让GPU KV Cache block非常紧张，因为vllm开启的参数是`--preemption-mode recompute`, 那么在KV Cache block 紧张的情况下会引发强制，导致重算，让vllm延迟变高。因为NEO实现了offload CPU to compute, 所以对于NEO是存在在相同请求速率下ouput token latency显示 vllm > neo情况的。
 
