@@ -1,0 +1,14 @@
+{
+    "model": "Llama-2-7b",
+    "model_path": "/workspace/huggingface/Meta-Llama-2-7B/",
+    "num_layers": 32,
+    "block_size": 16,
+    "max_model_len": 26400,
+    "max_num_seqs": 2048,
+    "max_num_batched_tokens": 26400,
+    "tensor_parallel_size": 2,
+    "gpu_memory_utilization": 0.99,
+    "num_gpu_blocks_override": 1650,
+    "swap_space": 60,
+    "library": "libpacpu-llama2_7b-tp2.so"
+}
