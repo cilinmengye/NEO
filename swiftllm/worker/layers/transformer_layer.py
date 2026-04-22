@@ -1,5 +1,17 @@
 """
-Transformer layer utilities in the Llama model
+Llama transformer layer 及其 worker-side timing 工具。
+
+这个文件里不仅实现了一层 transformer 的 forward，还承担了 NEO worker 侧最细粒度的
+性能测量职责：
+
+- 线性 / post-layer 相关时间；
+- GPU prefill attention 时间；
+- GPU decode attention 时间；
+- CPU decode attention 时间；
+- pipeline 下 Python launch / 调度额外开销。
+
+这些 layer-level timing 最终会被 `worker/model.py` 中的 `ModelPerfResult` 汇总，并由
+server 侧 `ModelProfiler` 消费。
 """
 
 import time
@@ -32,80 +44,128 @@ from swiftllm.worker.kernels.prefill_attn import prefill_attention
 
 class TransformerEvents:
     """
-    Performance monitoring & synchronization events for a transformer layer
+    单层 transformer 的性能监控与同步观察点。
+
+    这里混合使用了两种时间来源：
+
+    - CUDA event：记录 GPU 段的 elapsed time；
+    - `time.perf_counter()`：记录 CPU decode 与 Python launch overhead。
+
+    此外 `qkvtr_e` 还承担同步作用：它标记“CPU decode 所需的 Q/K/V 已经搬到 host buffer，
+    CPU 自定义算子可以开始”的边界。
     """
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
+        # 当前 stage 的起点；`linr_time` 会从这里算到 `linr_e`。
         self.stage_s = torch.cuda.Event(enable_timing=True)
+        # 线性部分结束点：包括 pre/post projection、RMSNorm、MLP 等非 attention 段。
         self.linr_e = torch.cuda.Event(enable_timing=True)
+        # GPU prefill attention 结束点。
         self.pref_e = torch.cuda.Event(enable_timing=True)
+        # GPU decode attention 结束点。
         self.gdec_e = torch.cuda.Event(enable_timing=True)
+        # QKV 异步搬到 CPU buffer 完成的观察点；CPU decode 会显式等待它。
         self.qkvtr_e = torch.cuda.Event()
+        # launch overhead 前半段的 CPU wall-clock 起点。
         self.lnch_s = 0.0
+        # 启动 CPU decode 之前、等待 QKV ready 前的 CPU wall-clock 分界点。
         self.lnch_m = 0.0
+        # CPU decode 真正进入 `paged_attention_cpu(...)` 的 wall-clock 起点。
         self.cdec_s = 0.0
+        # CPU decode 算子返回时的 wall-clock 终点。
         self.cdec_e = 0.0
+        # launch overhead 后半段的 CPU wall-clock 终点。
         self.lnch_e = 0.0
-    
+
     @property
     def linr_time(self) -> float:
         """
-        Time for linear operations + other small operations other than attention
+        当前 stage 中线性 / 非 attention 部分的 GPU 时间。
+
+        区间是 `stage_s -> linr_e`。在不同执行形态下，这段可能对应：
+        - sequential：本层 preproj 到 postproj/MLP；
+        - pipeline：某个 stage 里 postproj+下一层 preproj 的组合。
         """
         return self.stage_s.elapsed_time(self.linr_e)
 
     @property
     def pref_time(self) -> float:
         """
-        Time for prefilling
+        GPU prefill attention 时间。
+
+        区间是 `linr_e -> pref_e`，表示 attention 段里 prefill 部分的完成时间。
         """
         return self.linr_e.elapsed_time(self.pref_e)
 
     @property
     def gdec_time(self) -> float:
         """
-        Time for GPU decoding
+        GPU decode attention 时间。
+
+        区间是 `pref_e -> gdec_e`，即 prefill 之后、CPU decode 之前的 GPU decode 段。
         """
         return self.pref_e.elapsed_time(self.gdec_e)
 
     @property
     def cdec_time(self) -> float:
         """
-        Time for CPU decoding
+        CPU decode wall-clock 时间。
+
+        这里不用 CUDA event，因为 `torch.ops.pacpu.paged_attention_cpu(...)` 是同步 CPU C++ op。
+        因此直接用 `cdec_s -> cdec_e` 的 wall-clock 区间表示。
         """
         return self.cdec_e - self.cdec_s
 
     @property
     def lnch_time(self) -> float:
         """
-        Time for kernel launch & other Python overheads other than CPU decoding
+        pipeline 中 CPU 侧 launch / Python 调度额外开销。
+
+        它不包含真正的 CPU decode 算子时间，而是把 CPU decode 之前和之后的两段 Python /
+        launch 开销拼起来：
+
+        - `lnch_s -> lnch_m`
+        - `cdec_e -> lnch_e`
         """
         return self.lnch_e - self.cdec_e + self.lnch_m - self.lnch_s
 
     def pf_record(self, name: str):
         """
-        Record the event if performance monitoring is enabled
+        在性能监控开启时记录指定 CUDA event。
         """
         if self.engine_config.monitor_performance:
             getattr(self, name).record()
 
     def pf_time(self, name: str):
         """
-        Record the time if performance monitoring is enabled
+        在性能监控开启时记录指定 CPU wall-clock 时间戳，单位毫秒。
+
+        CPU decode 与 launch overhead 之所以不用 CUDA event，是因为这两段跨越了 Python 调度、
+        CPU 自定义算子与异步回拷，直接用 wall-clock 更符合当前代码路径的实际边界。
         """
         if self.engine_config.monitor_performance:
             setattr(self, name, time.perf_counter() * 1e3) # ms
 
     def pf_time_nocpu(self):
         """
-        If performance monitoring is enabled but there is no CPU decoding sequences, set CPU time stamps to the current time
+        在本层没有 CPU decode request 时写入占位时间戳。
+
+        这样 `cdec_time` 会自然变成 0，而 `lnch_time` 仍能保持连续口径；否则后续聚合
+        `ModelPerfResult` 时，这几个字段会因为缺少时间戳而断裂。
         """
         if self.engine_config.monitor_performance:
             self.lnch_m = self.cdec_s = self.cdec_e = time.perf_counter()
 
 class LlamaTransformerLayer:
     """
-    A transformer layer in the Llama model, may contain weights of the next layer
+    Llama 的一层 transformer。
+
+    除了执行本层 forward 外，它还维护两套 `TransformerEvents`：
+    - `events[0]`
+    - `events[1]`
+
+    在 sequential 路径里，两套槽位会被同一 batch 的不同线性边界复用；
+    在 pipeline 路径里，它们则对应两个 pipeline stage，而不是简单对应“batch0 / batch1”。
     """
     def __init__(
         self,
@@ -131,21 +191,27 @@ class LlamaTransformerLayer:
 
     def set_swapper(self, swapper: Swapper):
         """
-        Set the swapper for the layer
+        注入当前层共享的 swapper / KV cache 管理器。
         """
         self.swapper = swapper
 
 
     def _comm_wait_compute(self):
         """
-        Do communication after necessary computation
+        让 CPU communication stream 等待默认 CUDA stream。
+
+        用于“先算后拷”路径：只有默认 stream 上的计算结果 ready 后，通信 stream 才能安全地
+        发起 host/device 拷贝或 swap。
         """
         self.cpu_communication_stream.wait_stream(torch.cuda.default_stream())
 
 
     def _compute_wait_comm(self):
         """
-        Do computation after necessary communication
+        让默认 CUDA stream 等待 CPU communication stream。
+
+        这对应“先拷后算”路径，例如 CPU decode 的输出回拷完成前，后续 post-projection
+        不能继续消费 attention 输出。
         """
         torch.cuda.default_stream().wait_stream(self.cpu_communication_stream)
 
@@ -164,7 +230,15 @@ class LlamaTransformerLayer:
         cur_stage: int = 0
     ):
         """
-        Initiate transfer of QKV to CPU buffers
+        把当前 batch 尾部的 CPU decode Q/K/V 异步搬到 host buffer。
+
+        这是 CPU decode 的前置准备阶段：
+        - 先让 communication stream 等待默认 stream 上的 QKV 计算完成；
+        - 再把最后 `num_cdecs` 条 request 的 Q/K/V 拷到 CPU buffer；
+        - 最后在 `qkvtr_e` 处打点，表示 CPU 侧 attention 的输入已经就绪。
+
+        `_attention()` 中的 `qkvtr_e.synchronize()` 会把这里作为“CPU op 可以真正开始”的
+        显式同步边界。
         """
         self._comm_wait_compute()
         if batch.num_cdecs > 0:
@@ -183,14 +257,17 @@ class LlamaTransformerLayer:
         batch: SubBatch,
     ):
         """
-        Swap blocks from GPU to CPU, assume that new prefilled KVs are ready in the last stage
+        把 CPU-prefill 产生的新 KV blocks 从 GPU swap 到 CPU。
+
+        这里假设“要被换出的新 prefill KV”已经在当前层的最后阶段准备好了，因此可以在
+        communication stream 上异步发起 swap，不阻塞默认计算流。
         """
         if batch.num_cprfs > 0:
             with torch.cuda.stream(self.cpu_communication_stream):
                 self.swapper.swap_blocks(
-                    batch.src_blk_ids, 
-                    batch.dst_blk_ids, 
-                    is_swap_out=True, 
+                    batch.src_blk_ids,
+                    batch.dst_blk_ids,
+                    is_swap_out=True,
                     gpu_layer=self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else self.layer_id,
                     cpu_layer=self.layer_id
                 )
@@ -203,7 +280,10 @@ class LlamaTransformerLayer:
         layer_off: int = 0
     ) -> tuple[torch.Tensor]:
         """
-        Perform pre-projection, including RMSNorm, QKV calculation, and rotary embedding
+        执行 pre-projection：RMSNorm、QKV 线性映射、RoPE，以及需要时的 KV cache 存储。
+
+        在 pipeline 路径里，`layer_off=1` 表示这里算出来的是“下一层要用的 QKV”，因此权重
+        取 `next_layer_weight`。
         """
         weight = self.weight if not layer_off else self.next_layer_weight
 
@@ -231,16 +311,16 @@ class LlamaTransformerLayer:
             batch.position_cos
         )
 
-        # Here we only store k, v for prefilling, the kernel won't store decoding KVs
+        # 这里只为 prefill request 存 KV；decode request 的 KV 不在这里显式写入。
         if batch.num_prefs > 0 and self.swapper is not None:
             gpu_layer = (self.layer_id + layer_off) % self.model_config.num_layers
             itm_layer = self.model_config.num_layers if self.engine_config.extra_layer_for_cprf else gpu_layer
-            # NOTE: if swapping is too slow, there's risk that we writes to what's being swapped out
+            # 如果前面还有未完成的 swap，先等通信 stream，避免写到仍在被 swap 的区域。
             self._compute_wait_comm()
             store_kvcache(
                 k,
                 v,
-                self.swapper.k_cache, 
+                self.swapper.k_cache,
                 self.swapper.v_cache,
                 self.swapper.gpu_block_table,
                 batch.prgd_seq_ids[:batch.num_prefs],
@@ -264,7 +344,15 @@ class LlamaTransformerLayer:
         cur_stage: int = 0 # also as the offset of layer_id
     ):
         """
-        Stores attention output of current batch into buffer o
+        执行 attention 段，并把结果写入当前 batch 的 `attn_out_buf`。
+
+        时序上分三段：
+        1. prefill attention（GPU）
+        2. GPU paged attention（GPU decode）
+        3. `torch.ops.pacpu.paged_attention_cpu(...)`（CPU decode）
+
+        `TransformerEvents` 会在这三段之间依次打点，从而把 layer-level timing 分解成
+        `pref_time / gdec_time / cdec_time / lnch_time`。
         """
 
         events = self.events[cur_stage]
@@ -272,8 +360,7 @@ class LlamaTransformerLayer:
         cur_layer_id = (self.layer_id + cur_stage) % self.model_config.num_layers
 
         if batch.num_prefs > 0:
-            # If we are using Ampere GPU or above, we can use the flash attention kernel.
-            # Otherwise, we use a customized prefilling kernel.
+            # prefill attention 先执行；Ampere 及以上优先用 flash-attn，否则退回自定义 kernel。
             if torch.cuda.get_device_properties(0).major >= 8:
                 # flash_attn.forward(
                 # pylint: disable=c-extension-no-member
@@ -304,10 +391,10 @@ class LlamaTransformerLayer:
                     q, k, v, o[:batch.sum_pref_toks],
                     self.model_config, self.engine_config, batch
                 )
+        # `linr_e -> pref_e` 对应 prefill attention 时间。
         events.pf_record("pref_e")
 
-        # Actually we can further separate KV-cache storing for prefilling and decoding,
-        # but since the kernel is fast enough, we put all to decoding stream for simplicity
+        # GPU decode attention 紧接着 prefill 之后执行；它在同一 attention 段内，但统计上单独切出来。
         if batch.num_gdecs > 0:
             # with torch.cuda.stream(self.decoding_piggyback_stream):
             #     torch.cuda.current_stream().wait_event(self.events[cur_stage].stage_s)
@@ -316,7 +403,7 @@ class LlamaTransformerLayer:
                 k[batch.sum_pref_toks:batch.sum_prgd_toks],
                 v[batch.sum_pref_toks:batch.sum_prgd_toks],
                 o[batch.sum_pref_toks:batch.sum_prgd_toks],
-                self.swapper.k_cache, 
+                self.swapper.k_cache,
                 self.swapper.v_cache,
                 self.model_config.softmax_scale,
                 self.swapper.gpu_block_table,
@@ -326,13 +413,18 @@ class LlamaTransformerLayer:
                 batch.seq_block_size,
                 batch.num_seq_blocks,
             )
+        # `pref_e -> gdec_e` 对应 GPU decode attention 时间。
         events.pf_record("gdec_e")
-                
+
         if batch.num_cdecs > 0:
             oc = self.swapper.o_cpu[:batch.num_cdecs]
+            # CPU launch overhead 的前半段：从 stage 开始到真正等待 CPU decode 输入 ready 之前。
             events.pf_time("lnch_m")
+            # 显式等待 `_transfer_qkv()` 完成，确保 CPU 侧拿到的 Q/K/V 已就绪。
             self.events[cur_stage].qkvtr_e.synchronize()
+            # CPU decode 的真正起点。
             events.pf_time("cdec_s")
+            # 这是同步 CPU C++ op；返回时 CPU attention 已经完成。
             torch.ops.pacpu.paged_attention_cpu(
                 cur_layer_id,
                 self.model_config.softmax_scale,
@@ -348,17 +440,23 @@ class LlamaTransformerLayer:
                 oc
             )
             events.pf_time("cdec_e")
+            # CPU 算子产出的 attention output 再异步回拷到 GPU，供后续 post-projection 消费。
             with torch.cuda.stream(self.cpu_communication_stream):
                 o[-batch.num_cdecs:, :].copy_(oc, non_blocking=True)
         else:
+            # 没有 CPU decode 时也写入占位时间戳，保持 `cdec_time / lnch_time` 统计口径一致。
             events.pf_time_nocpu()
+        # 默认 CUDA stream 在继续 post-projection 前，必须等 CPU decode 输出回拷完成。
         self._compute_wait_comm() # Wait for CPU decoding to finish
 
 
     def _postproj(
         self,
-        batch: SubBatch        
+        batch: SubBatch
     ) -> torch.Tensor:
+        """
+        执行 attention 之后的输出投影、FFN 与残差更新。
+        """
         o = linear(batch.attn_out_buf, self.weight.o_proj)
         self._maybe_allreduce(o)
         fused_add_rmsnorm_inplace(o, batch.residual_buf, self.weight.ffn_norm, self.model_config.rms_norm_eps)
@@ -372,12 +470,13 @@ class LlamaTransformerLayer:
 
     def forward(self, batch: SubBatch, embeddings: torch.Tensor) -> torch.Tensor:
         """
-        (fused) Add last layer's residual, and perform RMSNorm
-        Before: input_embds is the output of the last FFN block, and residual_buf
-                is the residual to be added to input_embds
-        After: input_embds will be RMSNorm(input_embds + residual_buf), and
-               residual_buf will be input_embds + residual_buf (which will be
-               used as the residual after the attention block)
+        sequential 单 batch 路径下执行本层 forward。
+
+        timing 上大致是：
+        - `stage_s -> linr_e`：preproj + postproj/MLP 等线性段；
+        - `linr_e -> pref_e -> gdec_e`：attention 内的 GPU 段；
+        - `cdec_s -> cdec_e`：CPU decode；
+        - `lnch_s/lnch_m/lnch_e`：围绕 CPU decode 的 launch / Python overhead。
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
@@ -386,6 +485,8 @@ class LlamaTransformerLayer:
         self._transfer_qkv(q, k, v, batch)
         self._attention(q, k, v, batch)
         del q, k, v
+        # sequential 路径里，events[1] 主要补“attention 之后那段 linear 边界”，
+        # 使 `ModelPerfResult` 能把本层完整 linear 开销拼出来。
         self.events[1].pf_record("stage_s")
         self._swap_out_blocks(batch)
         embeddings = self._postproj(batch)
@@ -403,15 +504,15 @@ class LlamaTransformerLayer:
         cur_stage: int,
     ) -> tuple[torch.Tensor]:
         """
-        Do 1 pipeline stage:
+        执行 pipeline 中的一个 steady-state stage。
 
-            batch 0 : o0   |=> post-projection[i] -> pre-projection[i+1] |=> qkv0
-            batch 1 : qkv1 |=>      attention[i + attn_layer_id_offs]    |=> [o1]
+        这一 stage 会同时交织两类工作：
 
-        buffer of o1 is given as input
+        - `batches[cur_stage]`：做 postproj，再为下一层做 preproj；
+        - `batches[cur_stage ^ 1]`：消费上一阶段留下的 QKV，执行 attention。
 
-        Note that batch-0 here may actually be batch-1 in the forward pass, should reverse the list
-        in the second stage
+        因而这里的 `events[cur_stage]` 记录的是“第 `cur_stage` 个 pipeline stage”的 timing，
+        不是简单记录某一个固定 batch 的 timing。
         """
         self.events[cur_stage].pf_record("stage_s")
         self.events[cur_stage].pf_time("lnch_s")
@@ -435,12 +536,13 @@ class LlamaTransformerLayer:
         batches: list[SubBatch]
     ) -> tuple[torch.Tensor]:
         """
-        Do all jobs for 1 transformer layer for 2 batches
+        对双 sub-batch 执行本层的 steady-state pipeline。
 
-        Note that the weights of pre-projection need to be of the next layer compared to the post-projection
+        它连续跑两个 `_forward_pipeline_stage()`：
+        - 先推进 stage 0；
+        - 再推进 stage 1。
 
-            batch 0 : o0   |=>  post-projection[i] -> pre-projection[i+1]  |        attention[i+1]                     |=> [o0']
-            batch 1 : qkv1 |=>       attention[i]                          | post-projection[i] -> pre-projection[i+1] |=> qkv1'
+        因此一层内部的两套 `TransformerEvents` 正好对应这两个 stage 槽位。
         """
         q0, k0, v0 = self._forward_pipeline_stage(q1, k1, v1, batches, cur_stage=0)
         q1, k1, v1 = self._forward_pipeline_stage(q0, k0, v0, batches, cur_stage=1)
@@ -454,13 +556,18 @@ class LlamaTransformerLayer:
         batches: list[SubBatch]
     ) -> tuple[torch.Tensor]:
         """
-        Do the first stage of the pipeline for 2 batches
+        执行双 sub-batch pipeline 的 first stage。
 
-        batch0 : embeddings0 |=> pre-projection -> attention       |=> [o0]
-        batch1 : embeddings1 |=>                  pre-projection   |=> q1, k1, v1
+        这里会：
+        - 先对 batch0 做 preproj 并直接开始 attention；
+        - 同时为 batch1 预先算出下一步要用的 QKV。
+
+        因此它负责把 pipeline 从“纯 embeddings 输入”推进到“后续各层 steady-state 可接续”的
+        状态。
         """
         embeddings = torch.split(embeddings, [batch.iter_width for batch in batches])
         q0, k0, v0 = self._preproj(embeddings[0], batches[0], layer_off=1)
+        # 第一段 attention 开始前，必须先确认之前异步发起的 swap 已经完成。
         self._compute_wait_comm() # Here we must make sure all swaps are done before the first attention
 
         self.events[1].pf_record("stage_s")
@@ -482,10 +589,14 @@ class LlamaTransformerLayer:
         batches: list[SubBatch]
     ) -> torch.Tensor:
         """
-        Do the last stage of the pipeline for 2 batches, return the concatenated output
+        执行双 sub-batch pipeline 的 last stage，并返回拼接后的输出。
 
-        batch0 : o0   |=> post-projection              |=> [f0]
-        batch1 : qkv1 |=> attention -> post-projection |=> [f1]
+        这里负责收尾：
+        - batch0 只剩 postproj / FFN；
+        - batch1 还要完成 attention，再接 postproj / FFN。
+
+        因此它与 `forward_first_stage()` 一起夹住中间的 `forward_double()` steady-state 段，
+        共同构成完整的双 sub-batch pipeline。
         """
         self.events[0].pf_record("stage_s")
         self.events[0].pf_time("lnch_s")
@@ -499,4 +610,3 @@ class LlamaTransformerLayer:
         e1 = self._postproj(batches[1])
 
         return torch.cat((e0, e1))
- 

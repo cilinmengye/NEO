@@ -1,7 +1,16 @@
 """
-LlamaModel - A Llama model that can be used for inference.
+LlamaModel worker 侧执行与性能采样逻辑。
 
-If performance monitoring is enabled, the model will record performance results.
+这个模块不只是“跑一次 forward”这么简单。在正常在线路径里，它是被 `Executor`
+驱动的模型 worker；而在启动阶段 profiling 路径里，它还负责：
+
+- 按 iteration 记录 model-level timing 边界；
+- 汇总各层 `TransformerEvents` 产出的 layer-level timing；
+- 在监控开启时把一次 iteration 物化成 `ModelPerfResult`；
+- 把这些原始测量结果返回给 `ModelProfiler`，供后者构造 profile tables。
+
+因此这里是 server 侧 `ModelProfiler -> Executor -> worker model` 性能采样链路里的
+数据面终点。
 """
 
 import json
@@ -25,21 +34,41 @@ from .layers.post_layer import LlamaPostLayer
 
 class ModelEvents:
     """
-    ModelEvents - A class that represents the GPU events of a forward pass of a model.
+    一次 model forward 的全局 timing 边界。
+
+    这里记录的是 model 级别的 CUDA event，不是某一层内部的 event：
+
+    - `frwd_s / frwd_e`：整次 forward 的起止；
+    - `fstg_s`：pre-layer 结束、进入 transformer body 之前；
+    - `mnbd_s / mnbd_e`：transformer main body 的起止；
+    - `lstg_e`：transformer body 结束、post-layer 开始之前。
+
+    `ModelPerfResult` 会把这些 event 与各层 `TransformerEvents` 一起消费，形成 profiler
+    真正需要的聚合指标。
     """
 
     def __init__(self, engine_config: EngineConfig):
         self.engine_config = engine_config
+        # 整次 model forward 的起点。
         self.frwd_s = torch.cuda.Event(enable_timing=True)
+        # pre-layer（embedding / input 准备）结束点。
         self.fstg_s = torch.cuda.Event(enable_timing=True)
+        # transformer main body 起点。
         self.mnbd_s = torch.cuda.Event(enable_timing=True)
+        # transformer main body 终点。
         self.mnbd_e = torch.cuda.Event(enable_timing=True)
+        # last-stage / post-layer 之前的边界。
         self.lstg_e = torch.cuda.Event(enable_timing=True)
+        # 整次 model forward 的终点。
         self.frwd_e = torch.cuda.Event(enable_timing=True)
 
     def pf_record(self, name:str):
         """
-        Record the event with the given name if performance monitoring is enabled.
+        在性能监控开启时记录指定 CUDA event。
+
+        启动阶段 `ModelProfiler._run_test_case()` 会先通过 `Executor` 打开
+        `engine_config.monitor_performance`；只有在该开关打开时，这些 event 才会真正被记录。
+        在线正常推理路径不会因此额外打点。
         """
         if self.engine_config.monitor_performance:
             getattr(self, name).record()
@@ -47,10 +76,21 @@ class ModelEvents:
 
 class ModelPerfResult:
     """
-    ModelPerfResult - A class that represents the performance results of a forward pass of a model.
+    一次 profiling iteration 的原始性能测量结果。
+
+    它不是在线调度器直接查询的 predictor，而是 worker 在一次 forward 结束后，把：
+
+    - model-level timing（来自 `ModelEvents`）
+    - layer-level timing（来自每层 `TransformerEvents`）
+
+    汇总成的一份可序列化结果。随后 `ModelProfiler` 会对多个 repeat 的
+    `ModelPerfResult` 做平均，得到 `avg_linr_time`、`avg_pref_time`、`avg_gdec_time`、
+    `avg_cdec_time`、`avg_lnch_time`，再回填给 `TablePerfPredictor`。
     """
 
     # pylint: disable=too-many-instance-attributes
+    # 这些字段正好对应 `ModelProfiler` 要回填的 5 类 profile table / 常量：
+    # linear、GPU prefill、GPU decode、CPU decode、launch overhead。
     fields_to_dump = [
         "avg_linr_time",
         "avg_pref_time",
@@ -59,31 +99,48 @@ class ModelPerfResult:
         "avg_lnch_time"
     ]
     def __init__(
-        self, 
+        self,
         layers: list[LlamaTransformerLayer],
         model_events: ModelEvents,
         use_pipline: bool
     ):
+        # 先同步，确保所有 CUDA event 和跨 stream 的异步拷贝都已完成，
+        # 这样下面读取 elapsed_time / CPU wall-clock 片段时口径才完整。
         torch.cuda.synchronize() # Ensure all events are recorded
         if use_pipline:
+            # pipeline / double sub-batch 模式下，layer.events[0/1] 分别对应两个 pipeline stage。
+            # `linr_times` 使用当前 stage 的线性段；而 pref/gdec/cdec 对应的是同一 stage 内
+            # 被 attention 消费的“另一侧 sub-batch”，因此这里按 `i ^ 1` 取值。
             self.linr_times = np.array([[layer.events[i].linr_time for layer in layers[:-1]] for i in range(2)])
             self.pref_times = np.array([[layer.events[i^1].pref_time for layer in layers] for i in range(2)])
             self.gdec_times = np.array([[layer.events[i^1].gdec_time for layer in layers] for i in range(2)])
             self.cdec_times = np.array([[layer.events[i^1].cdec_time for layer in layers] for i in range(2)])
             self.lnch_times = np.array([[layer.events[i].lnch_time for layer in layers] for i in range(2)])
         else:
+            # sequential 单 batch 模式下，每层会同时用到 events[0] 与 events[1]：
+            # - events[0] 覆盖真正的 attention / CPU decode / launch timing；
+            # - events[1] 主要补 post-proj 之后那段 linear 边界。
+            # 因此 linear 时间要把两套槽位加起来，而 pref/gdec/cdec/lnch 则直接取 stage 0。
             self.linr_times = np.array([sum(layer.events[i].linr_time for i in range(2)) for layer in layers])
             self.pref_times = np.array([layer.events[0].pref_time for layer in layers])
             self.gdec_times = np.array([layer.events[0].gdec_time for layer in layers])
             self.cdec_times = np.array([layer.events[0].cdec_time for layer in layers])
             self.lnch_times = np.array([layer.events[0].lnch_time for layer in layers])
 
+        # 以下是 model-level 切片时间：
+        # - prlr_time: pre-layer / 输入准备阶段
+        # - fstg_time: first-stage 到 main body 入口之间
+        # - mnbd_time: transformer main body 本体
+        # - lstg_time: main body 结束到 last-stage 边界
+        # - polr_time: post-layer / sampling 阶段
         self.prlr_time = model_events.frwd_s.elapsed_time(model_events.fstg_s)
         self.fstg_time = model_events.fstg_s.elapsed_time(model_events.mnbd_s)
         self.mnbd_time = model_events.mnbd_s.elapsed_time(model_events.mnbd_e)
         self.lstg_time = model_events.mnbd_e.elapsed_time(model_events.lstg_e)
         self.polr_time = model_events.lstg_e.elapsed_time(model_events.frwd_e)
 
+        # `avg_*` 是 profiler 真正消费的聚合结果。
+        # 对 sequential 情况它们是一维数组；对 pipeline 情况则会保留双 stage 维度。
         self.avg_linr_time = self.linr_times.mean(-1)
         self.avg_pref_time = self.pref_times.mean(-1)
         self.avg_gdec_time = self.gdec_times.mean(-1)
@@ -98,7 +155,11 @@ class ModelPerfResult:
     @staticmethod
     def mean(results: list["ModelPerfResult"], name: str) -> float:
         """
-        Compute the average of a field in a list of ModelPerfResult objects.
+        对多次 profiling repeat 的同名字段做平均。
+
+        `ModelProfiler` 在 warmup 之后会重复执行同一个 profiling case，多次 iteration 的
+        原始结果就存放在 `results` 里。这里返回的是该 case 在字段 `name` 上的平均值，
+        不是在线运行过程中的滚动统计。
         """
         ret = np.array([getattr(result, name) for result in results]).mean(0).tolist()
         return ret
@@ -106,7 +167,7 @@ class ModelPerfResult:
     @staticmethod
     def mean_all(results: list["ModelPerfResult"]) -> dict[str, float]:
         """
-        Compute the average of all fields in a list of ModelPerfResult objects.
+        对所有 profiler 关心的聚合字段统一求平均。
         """
         return {
             field: ModelPerfResult.mean(results, field) for field in ModelPerfResult.fields_to_dump
@@ -116,10 +177,15 @@ class ModelPerfResult:
 
 class LlamaModel:
     """
-    LlamaModel - A Llama model that can be used for inference.
+    Llama worker 模型。
 
-    This class also acts as a "worker" that resides on a particular GPU, waiting
-    for the control plane (the executor) to send commands.
+    它既是实际执行 forward 的 worker，也是 profiling 模式下性能数据的生产者：
+
+    - `Executor.do_one_iteration()` 驱动这里执行一次 iteration；
+    - 若 `monitor_performance=True`，本模块会记录 event / timestamp；
+    - iteration 结束后把结果整理成 `ModelPerfResult`；
+    - `ModelProfiler` 再通过 `Executor.turn_off_perf_monitor_and_flush_results()` 把这些
+      结果取回并做平均。
 
     To initialize, please:
     - call __init__()
@@ -135,11 +201,16 @@ class LlamaModel:
         rank: int
     ):
         """
-        Initialize the LlamaModel.
+        初始化 worker 侧 LlamaModel。
 
-        Loads model weights, inits RoPE cache, and initializes layers.
+        这里会完成：
+        - 权重加载；
+        -各层与 buffer 初始化；
+        - CPU/GPU 通信 stream 建立；
+        - profiling 结果缓存与 model-level events 初始化。
 
-        The block tables are not initialized here, as num_blocks is not known yet.
+        KV cache / swap 相关结构则要等 `num_gpu_blocks / num_cpu_blocks` 确定后，
+        由 `init_kvcache_and_swap()` 再初始化。
         """
         self.engine_config = engine_config
         self.model_config = model_config
@@ -149,7 +220,7 @@ class LlamaModel:
 
         # CPU kernel library & stream
         if engine_config.library_path:
-            torch.ops.load_library(engine_config.library_path)        
+            torch.ops.load_library(engine_config.library_path)
         self.cpu_communication_stream = torch.cuda.Stream()
 
         # Load weights
@@ -186,17 +257,17 @@ class LlamaModel:
         # Swapper
         self.swapper = None
 
-        # List of performance results, unused if monitor_performance is False
+        # profiling 模式下，worker 会把每次 iteration 的 `ModelPerfResult` 先缓存到这里，
+        # 等 `turn_off_perf_monitor_and_flush_results()` 时统一返回给 server 侧 profiler。
         self.perf_results = []
+        # 一次 model forward 的全局 timing 边界。
         self.events = ModelEvents(engine_config)
-    
+
 
     @torch.inference_mode()
     def init_kvcache_and_swap(self, engine_config: EngineConfig):
         """
-        Initialize the key-value cache on both CPU and GPU.
-
-        Update engine config
+        根据 profiler 已测出的 block 数初始化 GPU/CPU KV cache 与 swapper。
         """
         self.engine_config.num_cpu_blocks = engine_config.num_cpu_blocks
         self.engine_config.num_gpu_blocks = engine_config.num_gpu_blocks
@@ -223,17 +294,20 @@ class LlamaModel:
 
     def _prepare_inputs(self, batches: list[SubBatch]):
         """
-        Prepare the batch for the forward pass. 
-        
-        Most work should be already be done by the control plane. We only need to prepare GPU specific data, including:
-            1. seq_ids and seq_lens
-            2. position_cos and position_sin
+        为 runtime forward 构造 GPU 侧输入结构。
+
+        调度器与 block manager 已经提前决定好 batch 形状和 block 映射；这里主要补齐
+        worker 真正执行时需要的 tensor 化字段，例如：
+
+        1. `prgd_seq_ids / prgd_seq_lens`
+        2. rotary embedding 所需的位置编码
+        3. attention / residual 中间 buffer
         """
         for batch in batches:
             batch.prgd_seq_ids = torch.tensor(batch.seq_ids_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
             batch.prgd_seq_lens = torch.tensor(batch.seq_lens_list[:batch.num_prgds], dtype=torch.int32, device='cuda')
             batch.pref_st_locs_we = torch.tensor(
-                [0] + list(itertools.accumulate(batch.seq_lens_list[:batch.num_prefs])), 
+                [0] + list(itertools.accumulate(batch.seq_lens_list[:batch.num_prefs])),
                 dtype=torch.int32, device='cuda'
             )
 
@@ -252,7 +326,7 @@ class LlamaModel:
             batch.residual_buf = torch.zeros(
                 (batch.iter_width, self.model_config.hidden_size), dtype=torch.float16, device='cuda'
             )
-            
+
             batch.last_token_indices = torch.cat([
                 batch.pref_st_locs_we[1:] - 1,
                 torch.arange(batch.sum_pref_toks, batch.iter_width, dtype=torch.int32, device='cuda')
@@ -263,10 +337,13 @@ class LlamaModel:
 
     def _forward_sequential(self, batch: SubBatch, embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Run a forward pass of the transformer layers in a sequential manner.
+        顺序执行单个 sub-batch 的 transformer body。
 
+        在 sequential 模式下，`mnbd_s -> mnbd_e` 覆盖的是整段 transformer layers 的总时间；
+        每层内部再通过 `TransformerEvents` 把 linear / prefill / GPU decode / CPU decode /
+        launch overhead 继续细分。
         """
-        # Wait for swappings to finish
+        # 在进入第一层 attention 前，先确保前面通过通信 stream 发起的 swap 已经可见。
         torch.cuda.current_stream().wait_stream(self.cpu_communication_stream)
         self.events.pf_record("mnbd_s")
         for layer in self.transformer_layers:
@@ -277,37 +354,47 @@ class LlamaModel:
 
     def _forward_pipeline(self, batches: list[SubBatch], embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Run a forward pass of the transformer layers in a pipelined manner.
+        以 double sub-batch pipeline 方式执行 transformer body。
+
+        形态上分三段：
+        1. `forward_first_stage()`：先把 batch0 的 attention 跑起来，同时为 batch1 做 preproj；
+        2. 中间各层 `forward_double()`：交织推进两个 sub-batch；
+        3. `forward_last_stage()`：收尾并产出拼接后的 embeddings。
+
+        model-level 的 `mnbd_s / mnbd_e` 只包住中间 steady-state pipeline body；
+        first / last stage 则由 `fstg_time / lstg_time` 单独体现。
         """
         assert len(batches) == 2
 
         q1, k1, v1 = self.transformer_layers[-1].forward_first_stage(embeddings, batches)
         self.events.pf_record("mnbd_s")
 
-        # In every iteration, attn_out_buf[0] is updated to newer version of batch 0's attention output and 
-        # q1, k1, v1 are updated to batch 1's newer version of q, k, v
+        # 每轮循环都会：
+        # - 把 batch0 的 attn_out_buf 推进到更新后的版本；
+        # - 把 batch1 的 q/k/v 推进到下一层所需的更新版本。
         for layer in self.transformer_layers[:-1]:
             q1, k1, v1 = layer.forward_double(q1, k1, v1, batches)
         self.events.pf_record("mnbd_e")
 
         embeddings = self.transformer_layers[-1].forward_last_stage(q1, k1, v1, batches)
         return embeddings
-    
-    
+
+
     @torch.inference_mode()
     def _forward_batches(self, batches: list[SubBatch]) -> list[int]:
         """
-        Run a forward pass of the LlamaModel.
+        执行一次 worker-side model iteration，并在需要时产出 `ModelPerfResult`。
 
-        Requires that blocks of requests are allocated and the block tables are set.
+        要求进入本函数前：
+        - 请求 blocks 已经分配完成；
+        - block tables 已经由 block manager / swapper 设置好。
 
-        Returns the output tokens.
+        返回本轮 forward 生成出的 output tokens。
         """
         self._prepare_inputs(batches)
         self.events.pf_record("frwd_s")
 
-        # Main body of the forward pass
-        # start = time.perf_counter()
+        # pre-layer 对输入 token 做 embedding / 输入准备，`frwd_s -> fstg_s` 对应模型级前置阶段。
         embeddings = self.pre_layer.forward(sum([Request.get_input_tokens(b.all_reqs) for b in batches], []))
         self.events.pf_record("fstg_s")
 
@@ -321,12 +408,12 @@ class LlamaModel:
 
         output_tokens = self.post_layer.forward(batches, embeddings, self.buffer.cur_residual_buf)
         self.events.pf_record("frwd_e")
-        # duration = time.perf_counter() - start
-        # print(f"Forward time: {duration*1000:.2f}ms")
 
         if self.engine_config.monitor_performance:
+            # profiling case 的原始测量结果在 iteration 全部结束后才统一 materialize。
+            # 这些结果稍后会被 `Executor -> ModelProfiler` flush 回 server 侧。
             self.perf_results.append(ModelPerfResult(self.transformer_layers, self.events, False))
-        
+
         return output_tokens
 
 
@@ -338,12 +425,15 @@ class LlamaModel:
         is_swap_out: bool = False
     ) -> list[int]:
         """
-        Run a forward iteration of the LlamaModel, with the following steps:
-            1. modify the block-tables according to the mappings
-            2. swap the specified sequences by direction given by is_swap_out and physical IDs given by swappings
-            3. run the forward pass of the model
+        执行一次完整 iteration。
 
-        Returns the output tokens.
+        顺序是：
+        1. 按 `mappings` 更新 block tables；
+        2. 按 `swappings` 发起 swap in/out；
+        3. 在这些 runtime 状态准备完成后，真正执行 `_forward_batches()`。
+
+        也就是说，worker 侧被测到的性能数据反映的是“带着真实 block table / swap 状态”的
+        一次 forward，而不是脱离 runtime 上下文的裸算子测试。
         """
 
         if self.swapper is not None:
@@ -355,31 +445,39 @@ class LlamaModel:
                     self.swapper.swap_blocks(*swappings, is_swap_out, layer_id, layer_id)
 
         return self._forward_batches(batches)
-    
+
 
     def turn_on_perf_monitor(self):
         """
-        Turn on performance monitoring.
+        打开 worker 侧性能监控。
+
+        server 侧 `ModelProfiler._run_test_case()` 会先通过 `Executor.turn_on_perf_monitor()`
+        调到这里。此后本 worker 在每次 iteration 中都会记录 event / timestamp，并把结果
+        追加到 `self.perf_results`。
         """
         self.engine_config.monitor_performance = True
 
 
     def turn_off_perf_monitor_and_flush_results(self):
         """
-        Flush the performance results and turn off performance monitoring.
+        关闭性能监控并返回本轮累计的 profiling 结果。
+
+        这是 `ModelProfiler` 消费 worker 侧测量数据的出口：profiler 在一个 test case
+        结束后通过 `Executor` 调到这里，把本轮 repeat 期间累积的 `ModelPerfResult` 全部取回，
+        随后再做 `ModelPerfResult.mean(...)` 聚合。
         """
         self.engine_config.monitor_performance = False
         ret = self.perf_results
         self.perf_results = []
         return ret
-        
+
 
 @ray.remote(num_cpus=8, num_gpus=1)
 class RemoteLlamaModel(LlamaModel):
     """
-    RemoteLlamaModel - A remote Llama model that can be used for inference.
+    供 RayExecutor 调用的远程 worker 版本。
     """
-    
+
     @torch.inference_mode()
     def __init__(
         self,
@@ -388,12 +486,12 @@ class RemoteLlamaModel(LlamaModel):
         rank: int
     ):
         """
-        Initialize the RemoteLlamaModel.
+        初始化远程 worker，并先建立 TP 所需的分布式通信组。
         """
 
         dist.init_process_group(
-            backend="nccl", 
-            world_size=engine_config.tensor_parallel_degree, 
+            backend="nccl",
+            world_size=engine_config.tensor_parallel_degree,
             rank=rank
         )
         super().__init__(engine_config, model_config, rank)

@@ -366,6 +366,52 @@ else:
 - `gpu_only_batch` 表示“如果本轮不做 pipeline，只跑一个 batch”的候选；
 - `batches[0]` 是 pipeline 方案中的第一个 sub-batch 初稿。
 
+### 8.1.1 先把 `gpu_only_batch`、`batches[0]`、`batches[1]` 的名字讲清楚
+
+这一段是最容易被变量名误导的地方。
+
+先说结论：
+
+- `gpu_only_batch` **不是**“这个 batch 里所有计算都只在 GPU 上完成”的意思；
+- `batches[0]` / `batches[1]` **也不是**“GPU batch / CPU batch”的设备二分；
+- 这个函数真正比较的，其实是两套 **execution plan**：
+  - `[gpu_only_batch]`：单 batch、sequential 候选；
+  - `[batches[0], batches[1]]`：双 sub-batch、pipelined 候选。
+
+为什么说 `gpu_only_batch` 不是字面“纯 GPU batch”？因为从 `scheduler.py:166-168` 可以直接看到，`cpu_prefill_reqs` 也会被加入 `gpu_only_batch`：
+
+```python
+for req in cpu_prefill_reqs:
+    batches[0].add_pref(req, is_gpu=False)
+    gpu_only_batch.add_pref(req, is_gpu=False)
+```
+
+也就是说，`gpu_only_batch` 内部完全可能包含 `cprf`。它真正的“only”，不是 only-GPU execution，而是 **only one batch / only sequential candidate**。
+
+再看 `SubBatch` 的定义。`swiftllm/structs.py:226-245` 说明一个 `SubBatch` 本来就可以同时装：
+
+- `gprf_reqs`
+- `cprf_reqs`
+- `gdec_reqs`
+- `cdec_reqs`
+
+所以：
+
+- `batches[0]` 不是“GPU 专用 batch”；
+- `batches[1]` 也不是“CPU 专用 batch”；
+- 它们只是 pipeline 时间结构里的两个 sub-batch。
+
+更准确地说：
+
+- `batches[0]` 是 pipeline 候选里的**第一个 sub-batch**，初始化时先承载全部 prefill 和全部 GPU decode；
+- `batches[1]` 一开始是空的，主要在 Step 3 里逐步承载被拆出来的一部分 CPU decode；
+- 后面 `_get_remains(...)`、Step 4、Step 5 都是在调整并比较这两个候选方案，而不是在区分“哪一个 batch 属于哪一种设备”。
+
+因此，如果要用中文给它们起更不容易误解的名字：
+
+- `gpu_only_batch` 更像“**单 batch 顺序执行候选**”；
+- `batches[0]` / `batches[1]` 更像“**双流水候选中的第一/第二子批次**”。
+
 ### 8.2 Step 2：先裁剪 sequential 候选中的 prefill
 
 `scheduler.py:177-183`：
@@ -408,6 +454,33 @@ while gpu_only_batch.get_num_prefs():
 
 - **pipeline 不是为了并发而并发，而是为了让 CPU 负载被 GPU 负载隐藏**；
 - **CPU decode 请求会被按负载平衡拆到两个 sub-batch，而不是平均切半。**
+
+### 8.3.1 `batches[0]` 和 `batches[1]` 在 Step 3 里是怎么分工的
+
+这里可以更具体地看它们的“角色演化”。
+
+在 Step 1 结束后：
+
+- `batches[0]` 已经装着本轮所有 prefill（`gprf + cprf`）以及全部 `gdec`；
+- `batches[1]` 还是空的；
+- `gpu_only_batch` 也有一份与 `batches[0]` 类似的骨架，但它属于 sequential 候选，不再参与后面的 cdec split。
+
+到了 Step 3，调度器开始遍历 `cpu_decoding_q`。这一步只是在构造 pipeline 候选 `[batches[0], batches[1]]`：
+
+- `gpu_only_batch` 在这一步不会再加入任何 `cdec`；
+- `batches[next_batch_idx].add_cdec(req)` 才是在给 pipeline 候选试探性加入 CPU decode；
+- `next_batch_idx` 会随着 `_get_remains(...)` 的结果动态变化，因此 cdec 不一定都落到 `batches[1]`，也可能有一部分落回 `batches[0]`。
+
+但从控制流上看，`batches[1]` 的主要职责确实是：
+
+- 作为第二个 sub-batch，承载被拆出来的一部分 CPU decode；
+- 让 pipeline 不再是“一个大 batch 里全都顺序跑”，而是形成两个在时间线上可交错的子批次。
+
+所以更准确的理解是：
+
+- `batches[0]` 是 **pipeline 主 batch / 第一子批次**；
+- `batches[1]` 是 **pipeline 辅助 batch / 第二子批次**；
+- 它们是按 overlap 目标拆出来的，不是按设备种类硬拆出来的。
 
 ### 8.4 `_get_remains()` 的真实含义
 
@@ -494,6 +567,168 @@ else:
 - 而是直接比较预测吞吐率。
 
 因此，论文里“load-aware scheduling dynamically chooses execution mode”的说法，在代码里最直接的对应就是这段逻辑。
+
+### 8.8 把返回值一路连到 runtime：为什么 `[gpu_only_batch]` 就是 sequential，`[batches[0], batches[1]]` 就是 pipeline
+
+如果只看 `scheduler.py`，用户很容易把这些变量名理解成“设备标签”。但把它们一路连到 runtime，就会发现代码真正关心的是 **batch 个数**，不是变量名。
+
+先看 `engine.py:195-208`。主循环里：
+
+1. `self.scheduler.get_next_batch()` 拿到 `batches`；
+2. `self.block_manager.prepare(batches, cur_swap_out, cur_swap_in)` 为这些 batch 准备 block 映射和 swap；
+3. `self.executor.do_one_iteration(batches, *forward_args)` 真正执行这一轮。
+
+也就是说，`_decide_mode_and_gen_batch()` 返回什么，engine 就真的拿什么去跑。
+
+再看 `worker/model.py:314-317`：
+
+```python
+if len(batches) == 1:
+    embeddings = self._forward_sequential(batches[0], embeddings)
+elif len(batches) == 2:
+    embeddings =  self._forward_pipeline(batches, embeddings)
+else:
+    raise ValueError("Invalid number of batches")
+```
+
+这里非常关键：
+
+- runtime 并没有识别“这个 batch 变量名叫不叫 `gpu_only_batch`”；
+- runtime 真正识别的是：
+  - `len(batches) == 1` → 走 `_forward_sequential(...)`
+  - `len(batches) == 2` → 走 `_forward_pipeline(...)`
+
+因此，`gpu_only_batch` 在 runtime 上的真实语义就是：
+
+- **单 batch 顺序执行方案里的那个唯一 batch**。
+
+而不是：
+
+- “所有计算都只在 GPU 做的 batch”。
+
+再补一层来自 `block_manager.py:235-259` 的证据。`prepare(...)` 会先对每个 batch 做 `set_model_forward_args(...)` 和 block allocation，然后还会专门对 `batch.num_cprfs` 做 cprf swap：
+
+```python
+for batch in batches:
+    sp, dv, dp = self._initiate_swap(
+        batch.all_reqs[:batch.num_cprfs], is_swap_out=True,
+        use_itm=self.engine_config.extra_layer_for_cprf, omit_last=False
+    )
+```
+
+这说明：
+
+- 即使返回的是 `[gpu_only_batch]`，只要里面含有 `cprf`，后续 runtime 仍然会准备 CPU 相关 swap；
+- 所以从 block manager 这一层也能反证：`gpu_only_batch` 不是“batch 内没有 CPU 路径”的意思。
+
+一句话总结这一节：
+
+> `_decide_mode_and_gen_batch()` 返回的不是“设备标签”，而是本轮真正要执行的 **1-batch sequential plan** 或 **2-sub-batch pipeline plan**。
+
+### 8.9 一个最小例子：把三种变量放到同一个场景里看
+
+假设当前系统状态如下：
+
+- `gpu_decoding_q` 里已有 2 条请求：`G1, G2`；
+- `cpu_decoding_q` 里已有 3 条请求：`C1, C2, C3`；
+- 本轮通过 `_get_next_batch_new()` 的 admission 后，又新接纳了：
+  - 1 条 `gpu_prefill`：`P_g`
+  - 2 条 `cpu_prefill`：`P_c1, P_c2`
+
+那么进入 `_decide_mode_and_gen_batch()` 时：
+
+- `gpu_prefill_reqs = [P_g]`
+- `cpu_prefill_reqs = [P_c1, P_c2]`
+- 当前队列里还有 `G1, G2` 和 `C1, C2, C3`
+
+#### 先看 Step 1 之后
+
+Step 1 会把：
+
+- `P_g`
+- `P_c1, P_c2`
+- `G1, G2`
+
+同时加入：
+
+- `gpu_only_batch`
+- `batches[0]`
+
+此时可以这样理解：
+
+- `gpu_only_batch = [P_g, P_c1, P_c2, G1, G2]`，表示“如果这轮只跑一个 batch，就先用这个候选”；
+- `batches[0] = [P_g, P_c1, P_c2, G1, G2]`，表示“如果这轮要做 pipeline，第一个 sub-batch 先从这份骨架开始”；
+- `batches[1] = []`，还没放任何东西。
+
+注意这里 `gpu_only_batch` 里已经含有 `P_c1, P_c2` 这样的 `cprf`，这就再次说明它不是字面“纯 GPU batch”。
+
+#### 再看 sequential 候选怎么演化
+
+Step 2 只修改 `gpu_only_batch`：
+
+- 如果当前 prefill 太多，`pop_pref()` 会优先弹掉末尾的 `cprf`；
+- 于是它可能从
+  - `[P_g, P_c1, P_c2, G1, G2]`
+  变成
+  - `[P_g, P_c1, G1, G2]`
+  甚至
+  - `[P_g, G1, G2]`
+- 这就是“单 batch sequential 候选”的最终形态。
+
+#### 再看 pipeline 候选怎么演化
+
+Step 3 开始，调度器尝试把 `C1, C2, C3` 加进 `batches[0]` / `batches[1]`。
+
+例如一种可能是：
+
+- 先把 `C1` 放到 `batches[1]`；
+- 再根据 `_get_remains(...)` 的结果把 `C2` 放到 `batches[0]`；
+- 发现 `C3` 太长，加入后会让 `min(remains) < 0`，于是跳过。
+
+那么此时可能得到：
+
+- `batches[0] = [P_g, P_c1, P_c2, G1, G2, C2]`
+- `batches[1] = [C1]`
+
+然后 Step 4 再看 `batches[0]` 是否太“胖”。如果太胖，就继续从里面优先删掉末尾的 `cprf`，例如变成：
+
+- `batches[0] = [P_g, P_c1, G1, G2, C2]`
+- `batches[1] = [C1]`
+
+这时双 sub-batch pipeline 候选就成形了。
+
+#### 最后 Step 5 做二选一
+
+- 如果 `pipelined_rate` 更高，函数返回 `[batches[0], batches[1]]`；
+- 否则返回 `[gpu_only_batch]`。
+
+后续到 `worker/model.py`：
+
+- 返回一个 batch，就走 `_forward_sequential(...)`；
+- 返回两个 batch，就走 `_forward_pipeline(...)`。
+
+所以这个例子里最关键的不是“谁属于 GPU、谁属于 CPU”，而是：
+
+- `gpu_only_batch` 和 `batches[0]` 虽然一开始长得很像，但它们属于**两套不同候选方案**；
+- `batches[1]` 也不是“CPU batch”这个静态概念，而是 pipeline 方案里被拆出来的第二个子批次。
+
+### 8.10 常见误解澄清
+
+#### 误解 1：`gpu_only_batch` 就是“所有计算都只在 GPU 做”
+
+不对。`scheduler.py:166-168` 已经说明 `cpu_prefill_reqs` 也会进入 `gpu_only_batch`；`block_manager.py:250-259` 还会继续对其中的 `cprf` 准备 swap。它真正表示的是 **single-batch sequential candidate**。
+
+#### 误解 2：`batches[0]` 是 GPU batch，`batches[1]` 是 CPU batch
+
+也不对。两个 `SubBatch` 都可以混合 `cprf/gprf/gdec/cdec`。它们只是 pipeline 时间线上的第一、第二子批次。
+
+#### 误解 3：Step 3 只是把 CPU decode 平均分成两半
+
+不对。Step 3 是根据 `_get_remains(...)` 做 overlap-aware 的试探式分配，目标是让 CPU decode 尽量被 GPU 工作隐藏，而不是平均切半。
+
+#### 误解 4：只要有 CPU decode，就一定会走 pipeline
+
+不对。`scheduler.py:224-234` 最终仍要比较 `seqential_rate` 与 `pipelined_rate`。如果单 batch 方案吞吐预测更高，函数仍会返回 `[gpu_only_batch]`。
 
 ---
 
