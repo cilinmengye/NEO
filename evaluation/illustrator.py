@@ -15,6 +15,76 @@ def _get_successful_records(file):
     return [item for item in data if item.get('ok', True)]
 
 
+def _get_metric_records(file):
+    data = _get_successful_records(file)
+    return data[len(data) // 4:]
+
+
+def _get_tpot_sample(record: dict) -> float | None:
+    if record.get('streamed') is not True:
+        return None
+
+    token_offsets = record.get('token_offsets')
+    if isinstance(token_offsets, list) and len(token_offsets) > 1:
+        return sum([
+            token_offsets[i] - token_offsets[i - 1]
+            for i in range(1, len(token_offsets))
+        ]) / (len(token_offsets) - 1)
+
+    chunk_offsets = record.get('chunk_offsets')
+    if isinstance(chunk_offsets, list) and len(chunk_offsets) > 1:
+        return sum([
+            chunk_offsets[i] - chunk_offsets[i - 1]
+            for i in range(1, len(chunk_offsets))
+        ]) / (len(chunk_offsets) - 1)
+
+    first_token_offset = record.get('first_token_offset')
+    events_received = record.get('events_received')
+    if first_token_offset is None or not isinstance(events_received, int) or events_received <= 1:
+        return None
+
+    remaining = (record['end'] - record['start']) - first_token_offset
+    if remaining <= 0:
+        return None
+
+    return remaining / (events_received - 1)
+
+
+def get_metric_avg(file, metric: str = "avg_per_token_latency"):
+    data = _get_metric_records(file)
+
+    if metric == "avg_per_token_latency":
+        return sum([(x['end'] - x['start']) / x['output_len'] for x in data]) / len(data)
+
+    if metric == "ttft":
+        ttfts = []
+        for record in data:
+            if record.get('streamed') is not True:
+                continue
+            first_token_offset = record.get('first_token_offset')
+            if first_token_offset is not None:
+                ttfts.append(first_token_offset)
+        if not ttfts:
+            raise RuntimeError(
+                f"No TTFT samples available in {file}; rerun benchmark with collect_stream_metrics=True"
+            )
+        return sum(ttfts) / len(ttfts)
+
+    if metric == "tpot":
+        tpots = []
+        for record in data:
+            sample = _get_tpot_sample(record)
+            if sample is not None:
+                tpots.append(sample)
+        if not tpots:
+            raise RuntimeError(
+                f"No TPOT samples available in {file}; need token_offsets or chunk stream events"
+            )
+        return sum(tpots) / len(tpots)
+
+    raise ValueError(f"Unknown metric: {metric}")
+
+
 def get_lat_avg(file):
     """
     end - start 是单个请求的 completion time / latency:
@@ -22,10 +92,17 @@ def get_lat_avg(file):
         单请求慢不慢
         平均请求时延是多少
     """
-    data = _get_successful_records(file)
-    # only take latter half
-    data = data[len(data) // 4:]
-    return sum([(x['end'] - x['start']) / (x['output_len']) for x in data]) / len(data)
+    return get_metric_avg(file)
+
+
+def _get_metric_ylabel(metric: str) -> str:
+    if metric == "avg_per_token_latency":
+        return "Average per token latency (s)"
+    if metric == "ttft":
+        return "TTFT (s)"
+    if metric == "tpot":
+        return "TPOT (s)"
+    raise ValueError(f"Unknown metric: {metric}")
 
 
 def draw_one_rl_diagram(
@@ -37,6 +114,7 @@ def draw_one_rl_diagram(
     ylim: float,
     markers: list[str],
     set_ylabel: bool = False,
+    metric: str = "avg_per_token_latency",
 ):
     lats = []
     max_rate = max([max(rate_list) for rate_list in rate_lists])
@@ -44,7 +122,7 @@ def draw_one_rl_diagram(
         lats.append([])
         for rate in rate_list:
             rate_str = str(rate).replace(".", "_")
-            lats[-1].append(get_lat_avg(f"{cur_dir}/results/{sys_file_name}-{data_name}-lat-{rate_str}.json"))
+            lats[-1].append(get_metric_avg(f"{cur_dir}/results/{sys_file_name}-{data_name}-lat-{rate_str}.json", metric))
 
     # ax.set_title(title, y=-0.3, fontsize="x-large")
 
@@ -54,7 +132,7 @@ def draw_one_rl_diagram(
 
     ax.set_xlabel("Ruquest rate (req/s)", fontsize="large")
     if set_ylabel:
-        ax.set_ylabel("Average per token latency (s)", fontsize="large")
+        ax.set_ylabel(_get_metric_ylabel(metric), fontsize="large")
     ax.set_xlim(0, max_rate)
     ax.set_xticks([0.5 * x for x in range(round(max_rate * 2 + 1))])
     # ax.set_ylim(-ylim / 50, ylim)

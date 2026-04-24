@@ -10,7 +10,7 @@ import numpy as np
 from tqdm import tqdm
 
 # pylint: disable=import-error
-from api_client import request_completions, AIOHTTP_TIMEOUT
+from api_client import request_completions, request_completions_stream, AIOHTTP_TIMEOUT
 
 cur_dir = os.path.dirname(os.path.abspath(__file__))
 res_dir = f"{cur_dir}/results"
@@ -22,11 +22,43 @@ logging.basicConfig(filename=f"{cur_dir}/evaluation.log", level=logging.INFO, da
 api_url = "http://localhost:8000/v1/completions"
 
 
+def _results_match_streaming_mode(all_results: list[dict], collect_stream_metrics: bool) -> bool:
+    if not collect_stream_metrics:
+        return True
+
+    for result in all_results:
+        if not result.get("ok", True):
+            continue
+
+        if result.get("streamed") is not True:
+            return False
+
+        if result.get("first_token_offset") is None:
+            return False
+
+        if "token_offsets" in result:
+            continue
+
+        if result.get("stream_observation") != "chunk":
+            return False
+
+        chunk_offsets = result.get("chunk_offsets")
+        if isinstance(chunk_offsets, list) and chunk_offsets:
+            continue
+
+        if not isinstance(result.get("events_received"), int) or result["events_received"] <= 0:
+            return False
+
+    return True
+
+
+
 async def request_completions_task(
     session: aiohttp.ClientSession,
     prompt: list[int],
     output_len: int,
     model_path: str,
+    collect_stream_metrics: bool = False,
 ):
     """
     发送单个请求并记录起止时间。
@@ -37,9 +69,13 @@ async def request_completions_task(
     """
     start = time.perf_counter()
     try:
-        await request_completions(session, api_url, prompt, output_len, model_path)
+        stream_result = None
+        if collect_stream_metrics:
+            stream_result = await request_completions_stream(session, api_url, prompt, output_len, model_path, start_time=start)
+        else:
+            await request_completions(session, api_url, prompt, output_len, model_path)
         end = time.perf_counter()
-        return {
+        result = {
             "input_len": len(prompt),
             "output_len": output_len,
             "start": start,
@@ -47,6 +83,9 @@ async def request_completions_task(
             "ok": True,
             "error": None,
         }
+        if stream_result is not None:
+            result.update(stream_result)
+        return result
     except Exception as exc:  # pylint: disable=broad-except
         end = time.perf_counter()
         return {
@@ -65,6 +104,7 @@ async def _run_rate_test(
     output_lens: list[int],
     model_path: str,
     rate: float,
+    collect_stream_metrics: bool = False,
 ):
     """
     保持原有 latency / rate test 语义：
@@ -77,7 +117,13 @@ async def _run_rate_test(
     for prompt, output_len in tqdm(zip(prompts, output_lens), total=len(prompts)):
         tasks.append(
             asyncio.create_task(
-                request_completions_task(session, prompt, output_len, model_path)
+                request_completions_task(
+                    session,
+                    prompt,
+                    output_len,
+                    model_path,
+                    collect_stream_metrics=collect_stream_metrics,
+                )
             )
         )
         await asyncio.sleep(gaps.pop(0))
@@ -149,17 +195,25 @@ async def run_test(
     model_path: str,
     rate: float = -1,  # -1 means throughput test
     max_inflight: int | None = None,
+    collect_stream_metrics: bool = False,
 ):
     if rate > 0:
         res_file = f"{res_prefix}-lat-{str(rate).replace('.', '_')}.json"
     else:
         res_file = f"{res_prefix}-tp.json"
 
+    should_rerun = False
     if os.path.exists(res_file):
         logger.info("Test result file already exists: %s", res_file)
         with open(res_file, "r") as f:
             all_results = json.load(f)
+        if not _results_match_streaming_mode(all_results, collect_stream_metrics):
+            logger.info("Cached result file %s is incompatible with collect_stream_metrics=%s, rerunning", res_file, collect_stream_metrics)
+            should_rerun = True
     else:
+        should_rerun = True
+
+    if should_rerun:
         logger.info("Running test, saving results to %s", res_file)
 
         # throughput 模式下默认只保留一个保守的在途窗口，防止客户端自己先被打爆。
@@ -171,7 +225,14 @@ async def run_test(
 
         async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, connector=connector) as session:
             if rate > 0:
-                all_results = await _run_rate_test(session, prompts, output_lens, model_path, rate)
+                all_results = await _run_rate_test(
+                    session,
+                    prompts,
+                    output_lens,
+                    model_path,
+                    rate,
+                    collect_stream_metrics=collect_stream_metrics,
+                )
             else:
                 all_results = await _run_throughput_test(session, prompts, output_lens, model_path, inflight)
 
@@ -193,6 +254,13 @@ async def run_test(
     successful_results = [result for result in all_results if result.get("ok", True)]
     if not successful_results:
         raise RuntimeError(f"No successful requests recorded in {res_file}")
+
+    # if collect_stream_metrics:
+    #     for result in successful_results:
+    #         if result.get("tokens_received") != result["output_len"]:
+    #             raise RuntimeError(
+    #                 f"Streaming token count mismatch in {res_file}: expected {result['output_len']}, got {result.get('tokens_received')}"
+    #             )
 
     times = [(result["start"], result["end"]) for result in successful_results]
 

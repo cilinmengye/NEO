@@ -17,7 +17,7 @@ from server import start_server, stop_server
 from benchmark import run_test, prepare_real_test
 from illustrator import draw_one_rl_diagram
 
-NUM_THRESHOLD = 2000
+NUM_THRESHOLD = 50
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 data_dir = f"{cur_dir}/data"
@@ -69,8 +69,8 @@ def prepare_ac_test(
 # vllm_rates = [0.5, 1.5, 2.5, 3.1, 3.5, 3.7, 3.9]
 # ours_rates = [0.5, 1.5, 2.5, 3.1, 3.5, 3.7, 3.9]
 vllm_rates = [1.5, 2.5, 3.1, 3.5]
-# ours_rates = [1.5, 2.5, 3.1, 3.5]
-ours_rates = [3.1, 3.5]
+ours_rates = [1.5, 2.5, 3.1, 3.5]
+# ours_rates = [3.1, 3.5]
 # Rates of requests per second, reduce the number of elements in the list to speed up the evaluation process.
 
 
@@ -86,17 +86,25 @@ async def one_round(server_name: str):
         # Feel free to comment out some of the following lines to reduce running time
         if server_name == "ours":
             for rate in ours_rates:
-                await run_test(*prepare_ac_test("ac", config, server_name, NUM_THRESHOLD), rate=rate)
+                await run_test(
+                    *prepare_ac_test("ac", config, server_name, NUM_THRESHOLD),
+                    rate=rate,
+                    collect_stream_metrics=True,
+                )
         if server_name == "vllm":
             for rate in vllm_rates:
-                await run_test(*prepare_ac_test("ac", config, server_name, NUM_THRESHOLD), rate=rate)
+                await run_test(
+                    *prepare_ac_test("ac", config, server_name, NUM_THRESHOLD),
+                    rate=rate,
+                    collect_stream_metrics=True,
+                )
     finally:
         stop_server()
     await asyncio.sleep(5)
 
 
 async def main():
-    # await one_round("vllm")
+    await one_round("vllm")
     await one_round("ours")
 
 
@@ -111,4 +119,26 @@ if __name__ == "__main__":
         ylim=2,
         markers=["o", "x"],
         set_ylabel=True
+    )
+    draw_one_rl_diagram(
+        title="fig6b-ttft",
+        data_name="ac",
+        sys_file_names=["vllm", "ours"],
+        sys_legend_names=["VLLM", "Ours"],
+        rate_lists=[vllm_rates, ours_rates],
+        ylim=2,
+        markers=["o", "x"],
+        set_ylabel=True,
+        metric="ttft",
+    )
+    draw_one_rl_diagram(
+        title="fig6b-tpot",
+        data_name="ac",
+        sys_file_names=["vllm", "ours"],
+        sys_legend_names=["VLLM", "Ours"],
+        rate_lists=[vllm_rates, ours_rates],
+        ylim=2,
+        markers=["o", "x"],
+        set_ylabel=True,
+        metric="tpot",
     )

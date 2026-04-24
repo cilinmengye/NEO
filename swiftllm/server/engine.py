@@ -164,6 +164,22 @@ class AsyncEngine(Engine):
         self.initialized = True
 
 
+    def _check_request_len(self, request: Request):
+        assert request.prompt_len + request.max_output_len <= self.engine_config.max_seq_len, \
+            f"Request length {request.prompt_len + request.output_len} exceeds max_seq_len {self.engine_config.max_seq_len}"
+
+
+    def _admit_request(self, request: Request, raw_request: RawRequest):
+        if isinstance(raw_request.prompt, str):
+            self.untokenized_raw_requests.append((request, raw_request.prompt))
+            return
+
+        request.prompt_token_ids = raw_request.prompt
+        request.prompt_len = len(raw_request.prompt)
+        self._check_request_len(request)
+        self.scheduler.on_requests_arrival([request])
+
+
     async def add_request_and_stream(self, raw_request: RawRequest) -> AsyncGenerator[StepOutput, None]:
         """
         以 streaming 模式提交请求，并逐 token 异步返回结果。
@@ -172,7 +188,7 @@ class AsyncEngine(Engine):
         loop 批量处理；之后 scheduler 才会在某一轮把它接纳进 batch。
         """
         request = Request(raw_request)
-        self.untokenized_raw_requests.append((request, raw_request.prompt))
+        self._admit_request(request, raw_request)
         while True:
             step_output = await request.output_q.get()
             yield step_output
@@ -189,15 +205,7 @@ class AsyncEngine(Engine):
         - 若已经是 token ids，则直接进入 scheduler。
         """
         request = Request(raw_request)
-        if isinstance(raw_request.prompt, str):
-            self.untokenized_raw_requests.append((request, raw_request.prompt))
-        else:
-            # 已经 tokenized 的请求可以直接进入 scheduler，无需再经过分词 actor。
-            request.prompt_token_ids = raw_request.prompt
-            request.prompt_len = len(raw_request.prompt)
-            assert request.prompt_len + request.max_output_len <= self.engine_config.max_seq_len, \
-                f"Request length {request.prompt_len + request.output_len} exceeds max_seq_len {self.engine_config.max_seq_len}"
-            self.scheduler.on_requests_arrival([request])
+        self._admit_request(request, raw_request)
 
         await request.finished_event.wait()
         return (request, request.output_token_ids)
@@ -221,6 +229,7 @@ class AsyncEngine(Engine):
             self.untokenized_raw_requests = []
 
             prompts = [prompt for _, prompt in cur_untokenized_raw_requests]
+            assert all(isinstance(prompt, str) for prompt in prompts), "untokenized_raw_requests must contain only string prompts"
             prompt_token_ids = await self.tokenization_engine.batched_tokenize.remote(prompts)
 
             new_requests = []

@@ -13,6 +13,11 @@ TIMEOUT_KEEP_ALIVE = 5  # in seconds
 app = fastapi.FastAPI()
 engine = None
 
+
+def _is_token_id_prompt(prompt) -> bool:
+    return isinstance(prompt, list) and all(isinstance(token_id, int) for token_id in prompt)
+
+
 @app.post("/v1/completions")
 async def generate(req: fastapi.Request) -> fastapi.Response:
     """
@@ -23,9 +28,16 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     - `stream`: boolean, whether to stream the output or not
     """
     req_dict = await req.json()
+    prompt = req_dict["prompt"]
+    if not isinstance(prompt, str) and not _is_token_id_prompt(prompt):
+        raise fastapi.HTTPException(
+            status_code=400,
+            detail="prompt must be a string or a flat list of token ids",
+        )
+
     raw_request = swiftllm.RawRequest(
-        prompt = req_dict["prompt"],
-        max_output_len = req_dict["max_tokens"]
+        prompt=prompt,
+        max_output_len=req_dict["max_tokens"]
     )
 
     if req_dict.get("stream", False):
@@ -37,12 +49,12 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
             wrapper(),
             media_type="text/plain"
         )
-    else:
-        # TODO Abort the request when the client disconnects
-        (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
-        return fastapi.responses.JSONResponse(
-            content={"choices": [{"text": output_token_ids}]}
-        )
+
+    # TODO Abort the request when the client disconnects
+    (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
+    return fastapi.responses.JSONResponse(
+        content={"choices": [{"text": output_token_ids}]}
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
