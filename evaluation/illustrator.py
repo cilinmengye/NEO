@@ -54,7 +54,8 @@ def get_metric_avg(file, metric: str = "avg_per_token_latency"):
     data = _get_metric_records(file)
 
     if metric == "avg_per_token_latency":
-        return sum([(x['end'] - x['start']) / x['output_len'] for x in data]) / len(data)
+        # 我这里进行了改动，原作者写的是 sum([(x['end'] - x['start']) / (x['output_len']) for x in data]) / len(data)
+        return sum([(x['end'] - x['start']) / (x['output_len'] + x['input_len']) for x in data]) / len(data)
 
     if metric == "ttft":
         ttfts = []

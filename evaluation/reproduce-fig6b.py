@@ -17,7 +17,7 @@ from server import start_server, stop_server
 from benchmark import run_test, prepare_real_test
 from illustrator import draw_one_rl_diagram
 
-NUM_THRESHOLD = 50
+NUM_THRESHOLD = 2000
 
 cur_dir = os.path.dirname(os.path.realpath(__file__))
 data_dir = f"{cur_dir}/data"

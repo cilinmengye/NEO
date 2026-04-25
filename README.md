@@ -8,7 +8,7 @@
 
 * NEO 理论上真正强大之处在于 **吞吐量**，因为其摘要就写着 `However, the limited GPU memory has largely limited the batch size achieved in practice, leaving significant GPU compute resources wasted.We present NEO, an online LLM inference system that offloads part of attention compute and KV cache states from the GPU to the local host CPU, effectively increasing the GPU batch size and thus inference throughput.`
 
-   * 虽然其最后展示的吞吐量依旧是比vllm低，理由是代码实现的不高效；但是其确实比同类(swiftllm)吞吐量更高。
+* 复现结果具体可以看`NEO/evaluation/pics`下，我还对 NEO vs vllm TTFT, TPOT 进行了补充实验
 
 # NEO: Saving GPU Memory Crisis with CPU Offloading for Online LLM Inference
 
