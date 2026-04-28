@@ -8,7 +8,7 @@ Llama transformer layer 及其 worker-side timing 工具。
 - GPU prefill attention 时间；
 - GPU decode attention 时间；
 - CPU decode attention 时间；
-- pipeline 下 Python launch / 调度额外开销。
+- pipeline 下 CPU decode 前后的非 CPU attention kernel 开销。
 
 这些 layer-level timing 最终会被 `worker/model.py` 中的 `ModelPerfResult` 汇总，并由
 server 侧 `ModelProfiler` 消费。
@@ -68,7 +68,7 @@ class TransformerEvents:
         self.qkvtr_e = torch.cuda.Event()
         # launch overhead 前半段的 CPU wall-clock 起点。
         self.lnch_s = 0.0
-        # 启动 CPU decode 之前、等待 QKV ready 前的 CPU wall-clock 分界点。
+        # 启动 CPU decode 之前、等待 QKV ready 之后的 CPU wall-clock 分界点。
         self.lnch_m = 0.0
         # CPU decode 真正进入 `paged_attention_cpu(...)` 的 wall-clock 起点。
         self.cdec_s = 0.0
@@ -119,13 +119,13 @@ class TransformerEvents:
     @property
     def lnch_time(self) -> float:
         """
-        pipeline 中 CPU 侧 launch / Python 调度额外开销。
+        pipeline 中 CPU decode 前后的非 CPU attention kernel 开销。
 
-        它不包含真正的 CPU decode 算子时间，而是把 CPU decode 之前和之后的两段 Python /
-        launch 开销拼起来：
+        它不包含真正的 CPU decode 算子时间，而是把 CPU decode 之前和之后的两段
+        wall-clock 开销拼起来：
 
-        - `lnch_s -> lnch_m`
-        - `cdec_e -> lnch_e`
+        - `lnch_s -> lnch_m`：包括等待 `_transfer_qkv()` 完成，使 CPU 侧 Q/K/V ready；
+        - `cdec_e -> lnch_e`：CPU decode 返回后的回拷发起与收尾。
         """
         return self.lnch_e - self.cdec_e + self.lnch_m - self.lnch_s
 
@@ -418,10 +418,11 @@ class LlamaTransformerLayer:
 
         if batch.num_cdecs > 0:
             oc = self.swapper.o_cpu[:batch.num_cdecs]
-            # CPU launch overhead 的前半段：从 stage 开始到真正等待 CPU decode 输入 ready 之前。
-            events.pf_time("lnch_m")
-            # 显式等待 `_transfer_qkv()` 完成，确保 CPU 侧拿到的 Q/K/V 已就绪。
+            # 与原作者代码不同：原作者先记录 `lnch_m`，再等待 `qkvtr_e`。
+            # 这里先等待 `_transfer_qkv()` 完成，把 Q/K/V readiness wait 计入 `lnch_time`。
             self.events[cur_stage].qkvtr_e.synchronize()
+            # CPU launch overhead 前半段的终点；之后立刻进入 CPU decode 本体计时。
+            events.pf_time("lnch_m")
             # CPU decode 的真正起点。
             events.pf_time("cdec_s")
             # 这是同步 CPU C++ op；返回时 CPU attention 已经完成。
